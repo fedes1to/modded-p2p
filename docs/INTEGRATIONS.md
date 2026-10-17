@@ -103,6 +103,16 @@ the env switch. barlink also carries a dedicated sglang adapter
 (`barlink.integrations.sglang`, tested against the fork it grew in) for code
 that calls `BarlinkCommunicator` directly instead of a torch process group.
 
+### Python 3.14 note
+
+sglang 0.5.22 pins `outlines==0.1.11` (schema-constrained decoding). That
+package's `outlines-core` predates Python 3.14 (its pyo3 cannot build for it),
+so a plain `pip install sglang` fails at the wheel-build step. It is only
+needed for guided/JSON-schema decoding; the workaround is
+`pip install --no-deps sglang` plus the dependency list without
+`outlines`/`outlines-core`, then run unconstrained generation — or use a
+Python 3.13 environment.
+
 ## Verifying the seam without a framework
 
 ```bash
