@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modded-p2p"
+version = "0.1.0"
+description = "Framework seams that route torch.distributed collectives through barlink-pcie's BAR1 transport (vLLM, sglang)"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-only" }
+dependencies = []
+
+[project.optional-dependencies]
+vllm = ["barlink @ git+https://github.com/efschu/barlink-pcie"]
+
+[project.entry-points."vllm.general_plugins"]
+modded_p2p = "modded_p2p.vllm_plugin:register"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["modded_p2p*"]

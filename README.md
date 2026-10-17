@@ -63,8 +63,20 @@ sudo bash scripts/revert.sh
 
 A reboot also returns you to the stock driver.
 
+## Frameworks
+
+**vLLM and sglang** can run their tensor-parallel collectives over the BAR1
+path instead of NCCL — barlink-pcie ships a real `torch.distributed` backend,
+and `integrations/python/` makes the frameworks choose it. Verified on this rig:
+two ranks, CUDA `all_reduce` byte-correct, transport `achieved: bar1` on both.
+Native C++ engines (llama.cpp, Strata) have no such seam and are not covered.
+
+Launch lines, limits and requirements:
+[docs/INTEGRATIONS.md](docs/INTEGRATIONS.md).
+
 ## Docs
 
+- [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) — vLLM / sglang setup and limits
 - [docs/DETAILS.md](docs/DETAILS.md) — how the patch works, troubleshooting, FAQ
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md) — measurements, conditions
 - [LICENSE-NOTES.md](LICENSE-NOTES.md) — licenses
