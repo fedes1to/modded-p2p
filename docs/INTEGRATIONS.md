@@ -69,6 +69,21 @@ Notes:
 - Tiny test models: cap `--max-num-seqs` (e.g. 4) — vLLM's flex-attention
   backend sizes buffers per sequence and can OOM on defaults.
 
+### Known environment blocker (not the transport)
+
+On this box (Python 3.14), vLLM 0.31 brings the TP group up and carries its
+collectives over barlink — log proof: `resolved backend=barlink` per worker,
+and barlink's own dispatcher lines for vLLM's all-reduce (e.g. the 64-byte
+calibration call falling back to host-staged, by design). The **first
+generation request then hangs** with
+`No available shared memory broadcast block found in 60 seconds`, and this
+**reproduces identically with plain NCCL and the plugin disabled** — it is a
+vLLM/Python-3.14 shared-memory issue on this machine, not the barlink path.
+The environment flags tried (none resolved it):
+`VLLM_ENABLE_V1_MULTIPROCESSING=0`, elevated timeouts, `--enforce-eager`,
+`--disable-custom-all-reduce`. A vLLM environment on Python 3.13 (its tested
+range) is the next step for full-generation validation.
+
 ## sglang
 
 sglang 0.5.22 pins `torch==2.14.1` — the same version this rig already runs, so
