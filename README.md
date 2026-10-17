@@ -63,16 +63,102 @@ sudo bash scripts/revert.sh
 
 A reboot also returns you to the stock driver.
 
-## Frameworks
+## Running vLLM or sglang over P2P (beginner version)
 
-**vLLM and sglang** can run their tensor-parallel collectives over the BAR1
-path instead of NCCL — barlink-pcie ships a real `torch.distributed` backend,
-and `integrations/python/` makes the frameworks choose it. Verified on this rig:
-two ranks, CUDA `all_reduce` byte-correct, transport `achieved: bar1` on both.
-Native C++ engines (llama.cpp, Strata) have no such seam and are not covered.
+**The short story.** vLLM and sglang talk between your GPUs through a library
+called NCCL. NCCL cannot use the direct path on these cards, so it bounces
+every message through your RAM. This project adds a small translation layer
+that lets the framework send those messages over the direct P2P path instead.
+You install the layer once and start the framework with two extra environment
+variables. That's the whole change.
 
-Launch lines, limits and requirements:
-[docs/INTEGRATIONS.md](docs/INTEGRATIONS.md).
+### vLLM (step by step)
+
+vLLM wants a specific PyTorch version, so give it its own environment:
+
+```bash
+# 1. one-time setup (replace the two /path/to with where your checkouts are)
+python3 -m venv ~/venv-vllm
+~/venv-vllm/bin/pip install vllm
+~/venv-vllm/bin/pip install -e /path/to/barlink-pcie -e /path/to/modded-p2p/integrations/python
+```
+
+```bash
+# 2. start it (root is needed: the P2P path asks the driver for a permission
+#    only root has). The first start compiles a small kernel: one-time, slower.
+. /etc/profile.d/barlink-p2p.sh
+export MODDED_P2P_VLLM=1
+export BARLINK_TRANSPORT=bar1
+sudo -E ~/venv-vllm/bin/vllm serve <your-model> \
+    --tensor-parallel-size 2 \
+    --disable-custom-all-reduce
+```
+
+**How to know it worked.** Each worker prints one line at startup:
+
+```
+modded_p2p: process group created, resolved backend=barlink
+```
+
+If you see that, the GPUs are talking over the direct path. If you do not,
+nothing is broken — vLLM simply fell back to its normal behaviour.
+
+**One warning that is not our fault.** On Python 3.14 (what current Arch
+ships), vLLM has a shared-memory bug of its own: the first request can hang
+with `No available shared memory broadcast block`. It happens with or without
+this project. Use Python 3.13 for vLLM if you hit it.
+
+### sglang (step by step)
+
+**Use Python 3.12 or 3.13.** On 3.14 some of sglang's binary packages cannot be
+installed at all (an upstream packaging problem, unrelated to this project).
+
+```bash
+# 1. one-time setup
+python3.13 -m venv ~/venv-sglang
+~/venv-sglang/bin/pip install sglang
+~/venv-sglang/bin/pip install -e /path/to/barlink-pcie -e /path/to/modded-p2p/integrations/python
+```
+
+```bash
+# 2. start it (root, same reason as above)
+. /etc/profile.d/barlink-p2p.sh
+export MODDED_P2P_SGLANG=1
+export BARLINK_TRANSPORT=bar1
+sudo -E ~/venv-sglang/bin/python -m modded_p2p.sglang_launch \
+    --model-path <your-model> --tp 2
+```
+
+The launcher is just sglang's own server with the translation layer switched
+on first. Without the two variables it behaves exactly like plain sglang.
+
+### Is it really using the direct path?
+
+The honest check (no framework needed):
+
+```bash
+. /etc/profile.d/barlink-p2p.sh
+export BARLINK_TRANSPORT=bar1
+sudo -E python -m torch.distributed.run --nproc_per_node=2 \
+    integrations/python/tests/test_backend_allreduce.py --backend barlink
+```
+
+It prints `all_reduce ...: OK` and a transport state line showing
+`requested: bar1, achieved: bar1`.
+
+### Things to know before you try
+
+- Every GPU process must see the same `BARLINK_*` variables. Mismatched values
+  between processes make the job hang instead of printing an error.
+- Messages smaller than 4 KiB deliberately use the old path (the direct path is
+  not faster for them). Larger messages are where the speedup lives.
+- Pipeline-parallel `send`/`recv` is not covered — tensor parallelism is.
+- Native C++ engines (llama.cpp, Strata) do not have this interface at all;
+  they are out of scope here.
+
+Details, limits and the measured numbers:
+[docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) and
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ## Docs
 
