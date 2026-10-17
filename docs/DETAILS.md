@@ -106,7 +106,7 @@ Files written by `install.sh`:
 The patched stack is not related to the **userspace** driver package: if an
 NVIDIA `.run` installer ever overwrote system libraries (libglvnd/`nvidia-utils`
 files replaced by regular files), reinstall those packages
-(`pacman -S libglvnd lib32-libglvnd nvidia-utils lib32-nvidia-utils` on Arch)
+(reinstall those packages with your package manager)
 to restore the packaged symlinks.
 
 ## Init support
@@ -120,7 +120,7 @@ to restore the packaged symlinks.
 The scripts detect which one is present; nothing is installed for an init the
 machine does not run.
 
-## Troubleshooting (the ones we actually hit)
+## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -142,7 +142,7 @@ machine does not run.
 
 ## FAQ
 
-**Does this resize BAR1 to 16 GiB?** No. On RTX 3080-class cards the vBIOS
+**Does this resize BAR1 to 16 GiB?** No. On cards of this class the vBIOS
 offers at most 256 MiB. This project makes P2P work *inside* that limit.
 
 **Will it help on a machine with PCIe 4.0 ×16 per card?** The transport

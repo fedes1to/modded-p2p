@@ -1,15 +1,17 @@
 # Performance — measured, with conditions
 
-Machine: 2× RTX 3080 20GB (GA102, 20 GiB each), Intel 12th gen,
-GPU0 on a CPU-attached Gen4 ×16 slot, **GPU1 on a PCH-attached Gen3 ×4 slot**,
-`intel_iommu=on iommu=pt`. P2P is locked out by the driver
-(`cudaDeviceCanAccessPeer = 0`), so every host-staged copy runs at ~2.6 GiB/s.
+## Test configuration
 
-Driver: open kernel modules 615.78.08 + `patches/BARLINK_PCIE-615.78.08.patch`,
-loaded with `BarlinkPeerBar1=1;RMPcieP2PType=1`, static BAR1 off.
-Tooling: `benchmarks/bench_host_transport.py` and `barlink_vs_nccl.py` from
-barlink-pcie; bfloat16; full operation duration; p50; 8–10 rounds;
-torch 2.14.1+cu130, NCCL 2.30.7.
+Two same-generation consumer GPUs (20 GiB each), one on a CPU-attached PCIe 4.0
+×16 slot and one on a PCH-attached PCIe 3.0 ×4 slot — a deliberately uneven
+pair, so the measurements show the floor rather than the ceiling. IOMMU in
+pass-through mode. Peer access is disabled by the driver
+(`cudaDeviceCanAccessPeer = 0`), so host-staged copies run at ~2.6 GiB/s.
+
+Driver: the patched open kernel modules from this repository, loaded with
+`BarlinkPeerBar1=1;RMPcieP2PType=1` and static BAR1 disabled. Tooling from
+barlink-pcie (`bench_host_transport.py`, `barlink_vs_nccl.py`), bfloat16, full
+operation duration, p50, 8–10 rounds.
 
 ## bar1 direct path vs NCCL (all_reduce)
 
@@ -23,7 +25,7 @@ torch 2.14.1+cu130, NCCL 2.30.7.
 
 The GPU1 ×4-Gen3 link caps both backends (bar1 ≈ 2340 MB/s effective at
 16 MiB, NCCL ≈ 2044 MB/s). On a ×16 Gen4 CPU-attached pair both numbers scale
-with the link; barlink's own reference rig measures ~80 % of link for writes
+with the link; barlink-pcie's published measurements report ~80 % of link for writes
 and ~1.3× full-duplex.
 
 ## Non-direct transports (same run, `barlink_vs_nccl.py`)
@@ -47,9 +49,9 @@ pointer**: `bad_bytes = 0` in both directions; `barlink.preflight` 6/6 OK.
 The sg table reports the offset (32 × 64 KiB contiguous), so no pattern scan
 is needed.
 
-## What we did not measure
+## What was not measured
 
-- A ×16/×16 CPU-attached pair (the intended production topology).
-- Multi-hour sustained load (`barlink-pcie` has 1.1 M checked rounds on their
-  rig; this one has minutes).
+- A ×16/×16 CPU-attached pair.
+- Multi-hour sustained load (barlink-pcie reports 1.1 M checked rounds in its
+  own testing; the figures here cover minutes).
 - Anything above 16 MiB payloads.

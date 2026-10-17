@@ -4,45 +4,42 @@ GPU↔GPU direct transfers (P2P) on consumer NVIDIA cards — **no ReBAR, no
 firmware flashing, no proprietary blobs**. Patches and scripts only.
 
 Built on [**barlink-pcie**](https://github.com/efschu/barlink-pcie) by
-**efschu** — all credit for the mechanism goes there. This repo adds a port of
-their driver patch to NVIDIA's 615.78.08 modules, two platform fixes, and a
-persistent one-command installer.
+**efschu** — all credit for the mechanism goes there. This repository adds a
+port of their driver patch to a current NVIDIA open-kernel-modules tag, two
+platform fixes, and a persistent installer.
 
-## What you get
+## What it changes
 
-Measured on 2× RTX 3080 20GB (the second card even on a slow ×4 slot),
-`all_reduce`, bfloat16:
-
-| size | modded-p2p | NCCL | gain |
-|---|---|---|---|
-| 20 KiB | 57.4 µs | **50.5 µs** | –12 % |
-| 1 MiB | **521.9 µs** | 560.2 µs | **+7 %** |
-| 4 MiB | **1938.9 µs** | 2099.7 µs | **+8 %** |
-| 16 MiB | **7169.0 µs** | 8208.9 µs | **+15 %** |
-
-Zero bad bytes in both directions. On a normal ×16 PCIe 4.0 pair everything is
-link-bound and scales up. Numbers and conditions:
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
-
-## How it works (short version)
+Consumer cards normally cannot address each other's memory: peer access is
+disabled and the BAR1 aperture is much smaller than the framebuffer, so
+collectives go through system RAM. This project exposes a direct path through
+the existing BAR1 aperture:
 
 1. A buffer on the target card is exported as a **dma-buf**.
-2. A tiny kernel module (holder) attaches to it — that makes the driver map
-   the buffer into the target card's **BAR1**.
+2. A small kernel module (the holder) attaches to it, which makes the driver
+   map that buffer into the target card's **BAR1**.
 3. The source card writes straight into that BAR1 slice over PCIe. No system
-   RAM in the path.
-4. Two driver patches make the driver allow this on consumer cards.
+   RAM in the data path.
+4. The driver patches make the driver permit this on consumer cards.
 
-That's it. No BAR resize, no VBIOS.
+BAR1 is not resized and the firmware is not touched.
+
+Measured at the collective level against NCCL: gains from roughly 80 KiB
+message size upward, a small loss for the smallest messages (below the direct
+path's minimum transfer size). Figures and the conditions they were taken
+under: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ## Requirements
 
-- Linux with NVIDIA **open** kernel modules (615.78.08 tested)
+- Linux with NVIDIA **open** kernel modules
 - Kernel headers, `gcc`, `git`, `patch`, `make`
 - Two NVIDIA GPUs of the same generation
 - systemd, OpenRC or dinit
-- Root (to load modules)
+- Root (to load kernel modules)
 - ~2 GB disk
+
+The installer pins the NVIDIA source tag it was written against; see
+[docs/DETAILS.md](docs/DETAILS.md).
 
 ## Install
 
@@ -53,7 +50,8 @@ sudo bash scripts/install.sh     # build + install + activate (screen blinks onc
 sudo bash scripts/verify.sh      # must print: PASS
 ```
 
-**Persists across reboots.** After a kernel upgrade, re-run `install.sh`.
+The install persists across reboots. After a kernel upgrade, re-run
+`install.sh`.
 
 Undo everything:
 
@@ -61,31 +59,29 @@ Undo everything:
 sudo bash scripts/revert.sh
 ```
 
-A reboot also returns you to the stock driver.
+A reboot also returns to the stock driver.
 
-## Running vLLM or sglang over P2P (beginner version)
+## vLLM and sglang
 
-**The short story.** vLLM and sglang talk between your GPUs through a library
-called NCCL. NCCL cannot use the direct path on these cards, so it bounces
-every message through your RAM. This project adds a small translation layer
-that lets the framework send those messages over the direct P2P path instead.
-You install the layer once and start the framework with two extra environment
-variables. That's the whole change.
+Both frameworks send tensor-parallel collectives through NCCL, which cannot use
+the direct path here. `integrations/python/` lets them use the direct path
+instead: the process group is created with barlink's transport, so the
+framework's collectives travel over BAR1.
 
-### vLLM (step by step)
+### vLLM
 
-vLLM wants a specific PyTorch version, so give it its own environment:
+vLLM requires a specific PyTorch build, so give it its own environment:
 
 ```bash
-# 1. one-time setup (replace the two /path/to with where your checkouts are)
 python3 -m venv ~/venv-vllm
 ~/venv-vllm/bin/pip install vllm
 ~/venv-vllm/bin/pip install -e /path/to/barlink-pcie -e /path/to/modded-p2p/integrations/python
 ```
 
+Start it (root is required — the driver's P2P path asks for a permission only
+root holds; the first start compiles a kernel once):
+
 ```bash
-# 2. start it (root is needed: the P2P path asks the driver for a permission
-#    only root has). The first start compiles a small kernel: one-time, slower.
 . /etc/profile.d/barlink-p2p.sh
 export MODDED_P2P_VLLM=1
 export BARLINK_TRANSPORT=bar1
@@ -94,34 +90,29 @@ sudo -E ~/venv-vllm/bin/vllm serve <your-model> \
     --disable-custom-all-reduce
 ```
 
-**How to know it worked.** Each worker prints one line at startup:
+Each worker prints one line at startup when the direct path is active:
 
 ```
 modded_p2p: process group created, resolved backend=barlink
 ```
 
-If you see that, the GPUs are talking over the direct path. If you do not,
-nothing is broken — vLLM simply fell back to its normal behaviour.
+Without that line the framework runs its normal path.
 
-**One warning that is not our fault.** On Python 3.14 (what current Arch
-ships), vLLM has a shared-memory bug of its own: the first request can hang
-with `No available shared memory broadcast block`. It happens with or without
-this project. Use Python 3.13 for vLLM if you hit it.
+Some Python releases are not supported by parts of vLLM's own runtime; if the
+first request hangs with `No available shared memory broadcast block`, that
+issue exists independently of this project — use a Python version the
+framework supports.
 
-### sglang (step by step)
+### sglang
 
-**Use Python 3.12 or 3.13.** On 3.14 some of sglang's binary packages cannot be
-installed at all (an upstream packaging problem, unrelated to this project).
+sglang's binary packages are not published for every Python version; use one
+its wheels exist for (see its installation docs).
 
 ```bash
-# 1. one-time setup
-python3.13 -m venv ~/venv-sglang
+python3 -m venv ~/venv-sglang
 ~/venv-sglang/bin/pip install sglang
 ~/venv-sglang/bin/pip install -e /path/to/barlink-pcie -e /path/to/modded-p2p/integrations/python
-```
 
-```bash
-# 2. start it (root, same reason as above)
 . /etc/profile.d/barlink-p2p.sh
 export MODDED_P2P_SGLANG=1
 export BARLINK_TRANSPORT=bar1
@@ -129,12 +120,10 @@ sudo -E ~/venv-sglang/bin/python -m modded_p2p.sglang_launch \
     --model-path <your-model> --tp 2
 ```
 
-The launcher is just sglang's own server with the translation layer switched
-on first. Without the two variables it behaves exactly like plain sglang.
+The launcher is sglang's own server with the transport selection applied
+first; without the two variables it behaves like plain sglang.
 
-### Is it really using the direct path?
-
-The honest check (no framework needed):
+### Verify the direct path without a framework
 
 ```bash
 . /etc/profile.d/barlink-p2p.sh
@@ -143,26 +132,24 @@ sudo -E python -m torch.distributed.run --nproc_per_node=2 \
     integrations/python/tests/test_backend_allreduce.py --backend barlink
 ```
 
-It prints `all_reduce ...: OK` and a transport state line showing
+Expected: `all_reduce ...: OK` per rank and a transport state line reading
 `requested: bar1, achieved: bar1`.
 
-### Things to know before you try
+### Operational notes
 
 - Every GPU process must see the same `BARLINK_*` variables. Mismatched values
-  between processes make the job hang instead of printing an error.
-- Messages smaller than 4 KiB deliberately use the old path (the direct path is
-  not faster for them). Larger messages are where the speedup lives.
-- Pipeline-parallel `send`/`recv` is not covered — tensor parallelism is.
-- Native C++ engines (llama.cpp, Strata) do not have this interface at all;
-  they are out of scope here.
+  between processes make the job hang rather than print an error.
+- Transfers below the transport's minimum size (4 KiB by default) deliberately
+  use the host-staged path; larger messages are where the direct path pays.
+- Tensor parallelism is covered; pipeline-parallel `send`/`recv` is not.
+- Native C++ engines (llama.cpp, Strata) have no `torch.distributed` interface
+  and are out of scope for these integrations.
 
-Details, limits and the measured numbers:
-[docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) and
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+Details and limits: [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md).
 
 ## Docs
 
-- [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) — vLLM / sglang setup and limits
+- [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) — framework integration and limits
 - [docs/DETAILS.md](docs/DETAILS.md) — how the patch works, troubleshooting, FAQ
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md) — measurements, conditions
 - [LICENSE-NOTES.md](LICENSE-NOTES.md) — licenses
