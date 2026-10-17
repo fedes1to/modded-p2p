@@ -1,0 +1,2608 @@
+diff --git a/kernel-open/common/inc/nv_uvm_types.h b/kernel-open/common/inc/nv_uvm_types.h
+index b906b49..dc97bd4 100644
+--- a/kernel-open/common/inc/nv_uvm_types.h
++++ b/kernel-open/common/inc/nv_uvm_types.h
+@@ -546,6 +546,14 @@ typedef struct UvmGpuP2PCapsParams_tag
+     NvU64 bar1DmaAddress[2];
+     NvU64 bar1DmaSize[2];
+ 
++    // BARLINK_PCIE: bar1DmaFbBase[i] is the FB physical offset that GPU[1-i]'s
++    // static BAR1 window starts at. The window covers GPU[1-i] FB
++    // [bar1DmaFbBase[i], bar1DmaFbBase[i] + bar1DmaSize[i]) and maps it to
++    // bar1DmaAddress[i], so the peer address of an FB physical address pa is
++    //     bar1DmaAddress[i] + (pa - bar1DmaFbBase[i])
++    // 0 means the window starts at FB offset 0 (stock behaviour).
++    NvU64 bar1DmaFbBase[2];
++
+     // True if GPU i can use PCIe atomics on locations in GPU[i-1]
+     // BAR1. This implies that GPU[i] can issue PCIe atomics,
+     // GPU[i-1] can accept PCIe atomics, and the bus interconnect
+@@ -723,6 +731,9 @@ typedef struct UvmGpuFbInfo_tag
+     NvBool bStaticBar1WriteCombined; // Write combined is enabled
+     NvU64  staticBar1StartOffset;  // The start offset of the the static mapping
+     NvU64  staticBar1Size;     // The size of the static mapping
++    // BARLINK_PCIE: FB physical offset the static mapping starts at. The
++    // window covers FB [staticBar1FbBase, staticBar1FbBase + staticBar1Size).
++    NvU64  staticBar1FbBase;
+     NvU32  heapStart;          // The start offset of heap in KB, helpful for MIG
+                                // systems
+ } UvmGpuFbInfo;
+diff --git a/kernel-open/nvidia-uvm/uvm_gpu.c b/kernel-open/nvidia-uvm/uvm_gpu.c
+index 4dedd4e..33f0945 100644
+--- a/kernel-open/nvidia-uvm/uvm_gpu.c
++++ b/kernel-open/nvidia-uvm/uvm_gpu.c
+@@ -1484,6 +1484,8 @@ static NV_STATUS init_parent_gpu(uvm_parent_gpu_t *parent_gpu,
+         parent_gpu->max_allocatable_address = fb_info.maxAllocatableAddress;
+         parent_gpu->static_bar1_start = pci_bar1_addr + fb_info.staticBar1StartOffset;
+         parent_gpu->static_bar1_size = fb_info.staticBar1Size;
++        // BARLINK_PCIE: FB offset the static BAR1 window starts at
++        parent_gpu->static_bar1_fb_base = fb_info.staticBar1FbBase;
+         parent_gpu->static_bar1_write_combined = fb_info.bStaticBar1WriteCombined;
+     }
+ 
+@@ -2493,6 +2495,10 @@ static NV_STATUS parent_peers_init(uvm_parent_gpu_t *parent_gpu0,
+     parent_peer_caps->bar1_p2p_dma_base_address[1] = p2p_caps_params.bar1DmaAddress[1];
+     parent_peer_caps->bar1_p2p_dma_size[0] = p2p_caps_params.bar1DmaSize[0];
+     parent_peer_caps->bar1_p2p_dma_size[1] = p2p_caps_params.bar1DmaSize[1];
++
++    // BARLINK_PCIE: FB offsets the respective peer windows start at
++    parent_peer_caps->bar1_p2p_fb_base[0] = p2p_caps_params.bar1DmaFbBase[0];
++    parent_peer_caps->bar1_p2p_fb_base[1] = p2p_caps_params.bar1DmaFbBase[1];
+     parent_peer_caps->bar1_p2p_pcie_atomics_enabled[0] = p2p_caps_params.bar1PcieAtomics[0];
+     parent_peer_caps->bar1_p2p_pcie_atomics_enabled[1] = p2p_caps_params.bar1PcieAtomics[1];
+ 
+@@ -3213,7 +3219,17 @@ uvm_gpu_phys_address_t uvm_gpu_peer_phys_address(uvm_gpu_t *owning_gpu, NvU64 ad
+         UVM_ASSERT(parent_peer_caps->link_type == UVM_GPU_LINK_PCIE_BAR1);
+         UVM_ASSERT(parent_peer_caps->bar1_p2p_dma_size[peer_index] != 0);
+ 
+-        address += parent_peer_caps->bar1_p2p_dma_base_address[peer_index];
++        // BARLINK_PCIE: the peer's static BAR1 window covers owning GPU FB
++        // [fb_base, fb_base + size), not [0, size), so the transform is
++        //     peer address = dma_base + (fb address - fb_base)
++        // Deliberately written as a single linear offset and without a range
++        // assert: uvm_mmu_create_peer_identity_mappings() calls this with
++        // address 0 purely to obtain that offset and the aperture, so an
++        // address below fb_base is a legitimate query here. Range enforcement
++        // for real mappings happens on the RM side in
++        // _nvGpuOpsEncodeBar1P2PAddrs() (rmapi/nv_gpu_ops.c).
++        address += parent_peer_caps->bar1_p2p_dma_base_address[peer_index] -
++                   parent_peer_caps->bar1_p2p_fb_base[peer_index];
+     }
+ 
+     return uvm_gpu_phys_address(aperture, address);
+diff --git a/kernel-open/nvidia-uvm/uvm_gpu.h b/kernel-open/nvidia-uvm/uvm_gpu.h
+index 45b2ff7..36893b9 100644
+--- a/kernel-open/nvidia-uvm/uvm_gpu.h
++++ b/kernel-open/nvidia-uvm/uvm_gpu.h
+@@ -1009,6 +1009,14 @@ struct uvm_parent_gpu_struct
+     // Physical address of the start of statically mapped fb memory in BAR1
+     NvU64 static_bar1_start;
+ 
++    // BARLINK_PCIE: FB physical offset the static BAR1 window starts at. The
++    // window covers FB [static_bar1_fb_base,
++    // static_bar1_fb_base + static_bar1_size) and is mapped at
++    // static_bar1_start, i.e. the BAR1 address of an FB physical address pa is
++    //     static_bar1_start + (pa - static_bar1_fb_base)
++    // 0 means the window starts at FB offset 0 (stock behaviour).
++    NvU64 static_bar1_fb_base;
++
+     // Size of statically mapped fb memory in BAR1.
+     NvU64 static_bar1_size;
+ 
+@@ -1482,6 +1490,15 @@ typedef struct
+     NvU64 bar1_p2p_dma_base_address[2];
+     NvU64 bar1_p2p_dma_size[2];
+ 
++    // BARLINK_PCIE: bar1_p2p_fb_base[i] is the FB physical offset at which
++    // GPU[1-i]'s static BAR1 window starts. The window covers GPU[1-i] FB
++    // [bar1_p2p_fb_base[i], bar1_p2p_fb_base[i] + bar1_p2p_dma_size[i]) and
++    // is mapped at bar1_p2p_dma_base_address[i], so the peer address of an FB
++    // physical address pa is
++    //     bar1_p2p_dma_base_address[i] + (pa - bar1_p2p_fb_base[i])
++    // 0 means the window starts at FB offset 0 (stock behaviour).
++    NvU64 bar1_p2p_fb_base[2];
++
+     // True if GPU[i] can use PCIe atomic operations when accessing BAR1
+     // region of GPU[i-1].
+     bool bar1_p2p_pcie_atomics_enabled[2];
+diff --git a/kernel-open/nvidia-uvm/uvm_va_range_device_p2p.c b/kernel-open/nvidia-uvm/uvm_va_range_device_p2p.c
+index 2d35657..1fa2eb8 100644
+--- a/kernel-open/nvidia-uvm/uvm_va_range_device_p2p.c
++++ b/kernel-open/nvidia-uvm/uvm_va_range_device_p2p.c
+@@ -246,10 +246,24 @@ static NV_STATUS get_gpu_pfns(uvm_gpu_t *gpu,
+         }
+         else {
+             NvU64 last_pfn = ((gpu->parent->static_bar1_start + gpu->parent->static_bar1_size) >> PAGE_SHIFT) - 1;
++            NvU64 first_pfn = gpu->parent->static_bar1_start >> PAGE_SHIFT;
++
++            // BARLINK_PCIE: the static BAR1 window starts at FB offset
++            // static_bar1_fb_base, so the BAR1 address of an FB physical
++            // address pa is static_bar1_start + (pa - static_bar1_fb_base).
++            // Addresses below the window have no BAR1 address at all.
++            if (pfns[i] < gpu->parent->static_bar1_fb_base) {
++                UVM_ERR_PRINT("GPU physical address 0x%llx is below the static BAR1 window base 0x%llx\n",
++                              pfns[i],
++                              gpu->parent->static_bar1_fb_base);
++                return NV_ERR_INVALID_ADDRESS;
++            }
+ 
+-            pfns[i] = (gpu->parent->static_bar1_start + pfns[i]) >> PAGE_SHIFT;
++            pfns[i] = (gpu->parent->static_bar1_start +
++                       (pfns[i] - gpu->parent->static_bar1_fb_base)) >> PAGE_SHIFT;
++            UVM_ASSERT(pfns[i] >= first_pfn);
+             UVM_ASSERT(pfns[i] <= last_pfn);
+-            if (pfns[i] > last_pfn)
++            if ((pfns[i] < first_pfn) || (pfns[i] > last_pfn))
+                 return NV_ERR_INVALID_ADDRESS;
+         }
+ 
+diff --git a/src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h b/src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h
+index 1469329..eb4f69a 100644
+--- a/src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h
++++ b/src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080fb.h
+@@ -2701,6 +2701,12 @@ typedef struct NV2080_CTRL_CMD_FB_STATS_GET_PARAMS {
+  *      This field indicates the start offset of the static BAR1.
+  * @params [OUT] NvU64 staticBar1Size:
+  *      This field indicates the size of the static BAR1.
++ * @params [OUT] NvU64 staticBar1FbBase:
++ *      BARLINK_PCIE: FB physical offset the static BAR1 window starts at.
++ *      The window covers FB [staticBar1FbBase, staticBar1FbBase +
++ *      staticBar1Size) and maps it to BAR1 offset staticBar1StartOffset:
++ *          BAR1 offset = fbPhysAddr - staticBar1FbBase + staticBar1StartOffset
++ *      0 means the window starts at FB offset 0 (the stock behaviour).
+  *
+  * Possible status values returned are
+  *   NV_OK
+@@ -2717,6 +2723,7 @@ typedef struct NV2080_CTRL_FB_GET_STATIC_BAR1_INFO_PARAMS {
+     NvBool bStaticBar1WriteCombined;
+     NV_DECLARE_ALIGNED(NvU64 staticBar1StartOffset, 8);
+     NV_DECLARE_ALIGNED(NvU64 staticBar1Size, 8);
++    NV_DECLARE_ALIGNED(NvU64 staticBar1FbBase, 8);   // BARLINK_PCIE
+ } NV2080_CTRL_FB_GET_STATIC_BAR1_INFO_PARAMS;
+ 
+ /*
+diff --git a/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c b/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c
+index 23204b2..51005bb 100644
+--- a/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c
++++ b/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c
+@@ -36,6 +36,8 @@
+ #include <gpu_mgr/gpu_mgr.h>
+ 
+ #include "gpu/bif/kernel_bif.h"
++#include "gpu/bus/kern_bus.h"     // BARLINK_PCIE: GPU_GET_KERNEL_BUS, kbusIsStaticBar1Enabled
++#include <nvrm_registry.h>        // BARLINK_PCIE: NV_REG_STR_BARLINK_PEER_BAR1
+ 
+ static NV_STATUS osCreateOsDescriptorFromPageArray(OBJGPU *, NvP64, NvHandle, NvU32, NvU64 *, MEMORY_DESCRIPTOR **, void **);
+ static void osDestroyOsDescriptorPageArray(PMEMORY_DESCRIPTOR);
+@@ -52,7 +54,7 @@ static void osDestroyOsDescriptorFromDmaBuf(PMEMORY_DESCRIPTOR);
+ static NV_STATUS osCreateOsDescriptorFromSgtPtr(OBJGPU *, NvP64, NvHandle, NvU32, NvU64 *, MEMORY_DESCRIPTOR **, void**);
+ static void osDestroyOsDescriptorFromSgt(PMEMORY_DESCRIPTOR);
+ 
+-static NV_STATUS osCheckGpuBarsOverlapAddrRange(NvRangeU64 addrRange);
++static NV_STATUS osCheckGpuBarsOverlapAddrRange(OBJGPU *pRequestingGpu, NvRangeU64 addrRange);
+ 
+ NV_STATUS
+ osCreateMemFromOsDescriptor
+@@ -368,6 +370,7 @@ osCreateOsDescriptorFromPageArray
+ static NV_STATUS
+ osCheckGpuBarsOverlapAddrRange
+ (
++    OBJGPU    *pRequestingGpu,
+     NvRangeU64 addrRange
+ )
+ {
+@@ -378,10 +381,182 @@ osCheckGpuBarsOverlapAddrRange
+     OBJGPU *pGpu;
+     NvU32 gpuMask;
+     NV_STATUS rmStatus;
++    NvBool bStaticBar1AnyActive = NV_FALSE;
++    NvU32 peerBar1Allowed = NV_REG_STR_BARLINK_PEER_BAR1_DISABLE;
+ 
+     rmStatus = gpumgrGetGpuAttachInfo(NULL, &gpuMask);
+     NV_ASSERT_OR_RETURN(rmStatus == NV_OK, rmStatus);
+ 
++    //
++    // BARLINK_PCIE: second, opt-in relaxation -- see the loop right below the
++    // static BAR1 one. Read once per registration; this is not a hot path
++    // (cuMemHostRegister at transport setup time).
++    //
++    // The current key is read first; the pre-rename key is read only when
++    // the current one is absent, so a driver that is already loaded on a rig
++    // and configured with the old name keeps working unchanged.
++    if (osReadRegistryDword(pRequestingGpu, NV_REG_STR_BARLINK_PEER_BAR1,
++                            &peerBar1Allowed) != NV_OK &&
++        osReadRegistryDword(pRequestingGpu, NV_REG_STR_BARLINK_PEER_BAR1_LEGACY,
++                            &peerBar1Allowed) != NV_OK)
++    {
++        peerBar1Allowed = NV_REG_STR_BARLINK_PEER_BAR1_DISABLE;
++    }
++
++    //
++    // BARLINK_PCIE: targeted relaxation of this guard.
++    //
++    // The direct usermode path for peer-BAR DMA is cuMemHostRegister() with
++    // CU_MEMHOSTREGISTER_IOMEMORY on another GPU's resource1_wc (its BAR1
++    // window). That lands in osCreateOsDescriptorFromIoMemory() -> here. With
++    // Static BAR1 active the registered range is exactly that peer GPU's
++    // static BAR1 bus-address window, and RM itself describes the same window
++    // as an ADDR_SYSMEM memdesc for P2P DMA (staticBar1.pDmaMemDesc in
++    // kbusEnableStaticBar1Mapping_TU102, bus address =
++    // gpumgrGetGpuPhysFbAddr(pGpu) + startOffset). Because that bus address
++    // equals gpumgrGetGpuPhysFbAddr(pGpu), the FB-overlap check further down
++    // would reject the registration ("overlaps with FB or GPU BAR2").
++    //
++    // We allow it ONLY when the whole requested range is fully contained in
++    // the static BAR1 window of a DIFFERENT GPU whose Static BAR1 is active.
++    // Everything else -- own FB, BAR0/BAR2, ranges outside the static window,
++    // Static BAR1 inactive -- keeps falling through to the unchanged guard
++    // below. When no GPU has Static BAR1 active (the stock case) this loop
++    // matches nothing, emits nothing, and the guard behaves exactly as before.
++    //
++    gpuInstance = 0;
++    while ((pGpu = gpumgrGetNextGpu(gpuMask, &gpuInstance)) != NULL)
++    {
++        KernelBus *pKernelBus = GPU_GET_KERNEL_BUS(pGpu);
++        NvRangeU64 staticBar1Range;
++        NvU64      staticBar1BusAddr;
++        NvU64      staticBar1Size;
++
++        if ((pKernelBus == NULL) ||
++            !kbusIsStaticBar1Enabled(pGpu, pKernelBus) ||
++            (pKernelBus->bar1[GPU_GFID_PF].staticBar1.pDmaMemDesc == NULL))
++        {
++            continue;
++        }
++
++        bStaticBar1AnyActive = NV_TRUE;
++
++        // Only a DIFFERENT GPU's BAR1 is a legitimate peer DMA target here.
++        if (pGpu == pRequestingGpu)
++        {
++            continue;
++        }
++
++        staticBar1Size    = pKernelBus->bar1[GPU_GFID_PF].staticBar1.size;
++        staticBar1BusAddr = gpumgrGetGpuPhysFbAddr(pGpu) +
++                            pKernelBus->bar1[GPU_GFID_PF].staticBar1.startOffset;
++
++        if (staticBar1Size == 0)
++        {
++            continue;
++        }
++
++        NV_INIT_RANGE(staticBar1Range, staticBar1BusAddr,
++                      staticBar1BusAddr + staticBar1Size - 1);
++
++        if ((addrRange.min >= staticBar1Range.min) &&
++            (addrRange.max <= staticBar1Range.max))
++        {
++            //
++            // BARLINK_PCIE: this check works purely in BAR1 bus-address
++            // space, so the FB offset the window maps (staticBar1.fbBase)
++            // does not enter the comparison. It is logged only.
++            //
++            NV_PRINTF(LEVEL_ERROR,
++                      "BARLINK_PCIE: ALLOW range 0x%016llx-0x%016llx : "
++                      "fully inside peer GPU%u static BAR1 0x%016llx-0x%016llx "
++                      "(FB base 0x%llx) (reason=PEER_STATIC_BAR1)\n",
++                      addrRange.min, addrRange.max, gpuGetInstance(pGpu),
++                      staticBar1Range.min, staticBar1Range.max,
++                      pKernelBus->bar1[GPU_GFID_PF].staticBar1.fbBase);
++            return NV_OK;
++        }
++    }
++
++    //
++    // BARLINK_PCIE: second relaxation, for the DYNAMIC BAR1 path (dma-buf).
++    //
++    // Why the static window is not enough: it only covers a fixed FB range.
++    // On a GPU whose BAR1 is far smaller than its FB (RTX 3080: 256 MiB BAR1,
++    // 20 GiB FB) no client allocation ever lands inside it -- measured, see
++    // BEFUND_STATISCHES_FENSTER_TAUGT_NICHT.md. The dma-buf export instead
++    // maps the exported buffer into BAR1 on demand
++    // (rm_dma_buf_map_mem_handle -> kbusMapFbAperture_HAL, osapi.c:5797;
++    // the returned bus address is kbusGetGpuFbPhysAddressForRdma() + BAR1
++    // offset, i.e. BAR1 base + offset). That address is somewhere in BAR1 and
++    // deliberately NOT in any fixed window, so the test above cannot cover it.
++    //
++    // The condition that does carry: the whole range lies inside the PCI BAR1
++    // aperture of a DIFFERENT attached GPU. Both bounds come straight from the
++    // PCI BARs (kbusGetPciBarOffset/Size, BUS_BAR_1) -- the same aperture the
++    // client mmaps as resource1_wc -- and not from fbLength, which for a small
++    // BAR GPU is much larger than BAR1 and would over-cover.
++    //
++    // Kept as tight as the mechanism allows:
++    //   - opt-in, BarlinkPeerBar1=1; without it nothing changes,
++    //   - only a DIFFERENT GPU, never the requesting one,
++    //   - full containment, no partial overlap,
++    //   - BAR1 only. BAR0 and BAR2 keep falling through to the deny checks.
++    //
++    // Residual risk, stated plainly: the guard exists because of the
++    // full-duplex P2P over BAR1 deadlock in bug 1571948 (see the comment at
++    // the call site in osCreateOsDescriptorFromIoMemory). This relaxation
++    // widens the exposure from "the peer's static BAR1 window" to "the peer's
++    // whole BAR1 aperture", which also contains the P2P write mailbox region
++    // and RM's own dynamic mappings. Writing there from a peer GPU is not
++    // something the deadlock analysis covers. Full duplex over the static
++    // window ran here for 30 s / 366574 rounds without a hang, which is
++    // evidence, not a guarantee.
++    //
++    if (peerBar1Allowed == NV_REG_STR_BARLINK_PEER_BAR1_ENABLE)
++    {
++        gpuInstance = 0;
++        while ((pGpu = gpumgrGetNextGpu(gpuMask, &gpuInstance)) != NULL)
++        {
++            KernelBus *pKernelBus = GPU_GET_KERNEL_BUS(pGpu);
++            NvRangeU64 bar1Range;
++            NvU64      bar1Base;
++            NvU64      bar1Size;
++
++            if ((pKernelBus == NULL) || (pGpu == pRequestingGpu))
++            {
++                continue;
++            }
++
++            if (kbusIsBar1Disabled(pKernelBus))
++            {
++                continue;
++            }
++
++            bar1Base = kbusGetPciBarOffset(pKernelBus, BUS_BAR_1);
++            bar1Size = kbusGetPciBarSize(pKernelBus, BUS_BAR_1);
++
++            if ((bar1Base == 0) || (bar1Size == 0))
++            {
++                continue;
++            }
++
++            NV_INIT_RANGE(bar1Range, bar1Base, bar1Base + bar1Size - 1);
++
++            if ((addrRange.min >= bar1Range.min) &&
++                (addrRange.max <= bar1Range.max))
++            {
++                NV_PRINTF(LEVEL_ERROR,
++                          "BARLINK_PCIE: ALLOW range 0x%016llx-0x%016llx : "
++                          "fully inside peer GPU%u PCI BAR1 0x%016llx-0x%016llx "
++                          "(reason=PEER_BAR1_APERTURE)\n",
++                          addrRange.min, addrRange.max, gpuGetInstance(pGpu),
++                          bar1Range.min, bar1Range.max);
++                return NV_OK;
++            }
++        }
++    }
++
+     gpuInstance = 0;
+     while ((pGpu = gpumgrGetNextGpu(gpuMask, &gpuInstance)) != NULL)
+     {
+@@ -390,6 +565,14 @@ osCheckGpuBarsOverlapAddrRange
+ 
+         if (NV_IS_OVERLAPPING_RANGE(gpuPhysAddrRange, addrRange))
+         {
++            if (bStaticBar1AnyActive)
++            {
++                NV_PRINTF(LEVEL_ERROR,
++                          "BARLINK_PCIE: DENY range 0x%016llx-0x%016llx : "
++                          "overlaps GPU%u BAR0 0x%016llx-0x%016llx (reason=GPU_BAR0)\n",
++                          addrRange.min, addrRange.max, gpuGetInstance(pGpu),
++                          gpuPhysAddrRange.min, gpuPhysAddrRange.max);
++            }
+             NV_PRINTF(LEVEL_ERROR,
+                       "%s(): phys range 0x%016llx-0x%016llx overlaps with GPU BAR0\n",
+                       __FUNCTION__, addrRange.min, addrRange.max);
+@@ -412,6 +595,17 @@ osCheckGpuBarsOverlapAddrRange
+         if (NV_IS_OVERLAPPING_RANGE(gpuPhysFbAddrRange, addrRange) ||
+             NV_IS_OVERLAPPING_RANGE(gpuPhysInstAddrRange, addrRange))
+         {
++            if (bStaticBar1AnyActive)
++            {
++                NV_PRINTF(LEVEL_ERROR,
++                          "BARLINK_PCIE: DENY range 0x%016llx-0x%016llx : "
++                          "overlaps GPU%u FB 0x%016llx-0x%016llx or BAR2 "
++                          "0x%016llx-0x%016llx, not contained in an active "
++                          "peer static BAR1 (reason=FB_OR_BAR2)\n",
++                          addrRange.min, addrRange.max, gpuGetInstance(pGpu),
++                          gpuPhysFbAddrRange.min, gpuPhysFbAddrRange.max,
++                          gpuPhysInstAddrRange.min, gpuPhysInstAddrRange.max);
++            }
+             NV_PRINTF(LEVEL_ERROR,
+                       "%s(): phys range 0x%016llx-0x%016llx overlaps with FB or GPU BAR2\n",
+                       __FUNCTION__, addrRange.min, addrRange.max);
+@@ -509,7 +703,7 @@ osCreateOsDescriptorFromIoMemory
+     physAddrRange.min = *base;
+     physAddrRange.max = *base + *pLimit;
+ 
+-    rmStatus = osCheckGpuBarsOverlapAddrRange(physAddrRange);
++    rmStatus = osCheckGpuBarsOverlapAddrRange(pGpu, physAddrRange);
+     if (rmStatus != NV_OK)
+     {
+         return rmStatus;
+diff --git a/src/nvidia/generated/g_kern_bus_nvoc.c b/src/nvidia/generated/g_kern_bus_nvoc.c
+index ea7dcba..3bd6c33 100644
+--- a/src/nvidia/generated/g_kern_bus_nvoc.c
++++ b/src/nvidia/generated/g_kern_bus_nvoc.c
+@@ -1064,7 +1064,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
+     // default
+     else
+     {
+-        pThis->__kbusGetBar1P2PDmaInfo__ = &kbusGetBar1P2PDmaInfo_395e98;
++        pThis->__kbusGetBar1P2PDmaInfo__ = &kbusGetBar1P2PDmaInfo_GH100;  // BARLINK_PCIE: stub replaced with the real implementation
+     }
+ 
+     // kbusShouldRefcountConstruct -- halified (2 hals) body
+@@ -1112,7 +1112,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
+     // default
+     else
+     {
+-        pThis->__kbusCreateP2PMappingForBar1P2P__ = &kbusCreateP2PMappingForBar1P2P_395e98;
++        pThis->__kbusCreateP2PMappingForBar1P2P__ = &kbusCreateP2PMappingForBar1P2P_GH100;  // BARLINK_PCIE: stub replaced with the real implementation
+     }
+ 
+     // kbusRemoveP2PMappingForBar1P2P -- halified (2 hals) body
+@@ -1124,7 +1124,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
+     // default
+     else
+     {
+-        pThis->__kbusRemoveP2PMappingForBar1P2P__ = &kbusRemoveP2PMappingForBar1P2P_395e98;
++        pThis->__kbusRemoveP2PMappingForBar1P2P__ = &kbusRemoveP2PMappingForBar1P2P_GH100;  // BARLINK_PCIE: stub replaced with the real implementation
+     }
+ 
+     // kbusHasPcieBar1P2PMapping -- halified (2 hals) body
+@@ -1136,7 +1136,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
+     // default
+     else
+     {
+-        pThis->__kbusHasPcieBar1P2PMapping__ = &kbusHasPcieBar1P2PMapping_d69453;
++        pThis->__kbusHasPcieBar1P2PMapping__ = &kbusHasPcieBar1P2PMapping_GH100;  // BARLINK_PCIE: stub replaced with the real implementation
+     }
+ 
+     // kbusIsPcieBar1P2PMappingSupported -- halified (2 hals) body
+@@ -1148,7 +1148,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
+     // default
+     else
+     {
+-        pThis->__kbusIsPcieBar1P2PMappingSupported__ = &kbusIsPcieBar1P2PMappingSupported_d69453;
++        pThis->__kbusIsPcieBar1P2PMappingSupported__ = &kbusIsPcieBar1P2PMappingSupported_GH100;  // BARLINK_PCIE: stub replaced with the real implementation
+     }
+ 
+     // kbusCheckFlaSupportedAndInit -- halified (2 hals) body
+diff --git a/src/nvidia/generated/g_kern_bus_nvoc.h b/src/nvidia/generated/g_kern_bus_nvoc.h
+index eae5168..e9a9f6d 100644
+--- a/src/nvidia/generated/g_kern_bus_nvoc.h
++++ b/src/nvidia/generated/g_kern_bus_nvoc.h
+@@ -266,6 +266,18 @@ typedef struct Bar1VaInfo
+         MEMORY_DESCRIPTOR  *pDmaMemDesc;
+         NvU64               startOffset;
+         NvU64               size;
++        //
++        // BARLINK_PCIE: FB physical offset the static window starts at.
++        // The window covers FB [fbBase, fbBase + size) and is mapped to
++        // BAR1 VA [startOffset, startOffset + size), i.e.
++        //     BAR1 VA = fbPhysAddr - fbBase + startOffset
++        // Determined by _kbusGetStaticBar1FbBase_TU102 as the base of the
++        // first FB region that is neither bRsvdRegion nor bInternalHeap,
++        // because only such regions are handed to PMA (see mem_mgr.c,
++        // _pmaInitFbRegions) and can therefore ever back a cudaMalloc.
++        // 0 restores the previous behaviour.
++        //
++        NvU64               fbBase;
+     } staticBar1;
+ } Bar1VaInfo;
+ 
+@@ -616,6 +628,9 @@ struct KernelBus {
+     NvBool bBar1ReuseEnabled;
+     NvU32 staticBar1ForceType;
++    NvU32 staticBar1WindowMB;   // BARLINK_PCIE: RMStaticBar1WindowMB, 0 = auto
++    NvU32 staticBar1ReserveMB;  // BARLINK_PCIE: RMStaticBar1ReserveMB, 0 = default
++    NvU32 staticBar1FbBaseMB;   // BARLINK_PCIE: RMStaticBar1FbBaseMB, 0 = auto
+     NvU32 staticBar1DefaultKind;
+     NvU32 staticBar1DefaultDmaFlags;
+     NvU64 staticBar1DefaultPageSize;
+     NvU32 bGrdmaForceSpa;
+diff --git a/src/nvidia/generated/g_virt_mem_allocator_nvoc.c b/src/nvidia/generated/g_virt_mem_allocator_nvoc.c
+index 2779abc..0050a13 100644
+--- a/src/nvidia/generated/g_virt_mem_allocator_nvoc.c
++++ b/src/nvidia/generated/g_virt_mem_allocator_nvoc.c
+@@ -336,7 +336,7 @@ static void __nvoc_init_funcTable_VirtMemAllocator_1(VirtMemAllocator *pThis, Gp
+     // default
+     else
+     {
+-        pThis->__dmaAllocBar1P2PMapping__ = &dmaAllocBar1P2PMapping_395e98;
++        pThis->__dmaAllocBar1P2PMapping__ = &dmaAllocBar1P2PMapping_GH100;  // BARLINK_PCIE: stub replaced with the real implementation
+     }
+ 
+     // dmaFreeBar1P2PMapping -- halified (2 hals) body
+@@ -348,7 +348,7 @@ static void __nvoc_init_funcTable_VirtMemAllocator_1(VirtMemAllocator *pThis, Gp
+     // default
+     else
+     {
+-        pThis->__dmaFreeBar1P2PMapping__ = &dmaFreeBar1P2PMapping_d44104;
++        pThis->__dmaFreeBar1P2PMapping__ = &dmaFreeBar1P2PMapping_GH100;  // BARLINK_PCIE: stub replaced with the real implementation
+     }
+ 
+     // dmaIsDefaultGpuUncached -- halified (2 hals) body
+diff --git a/src/nvidia/inc/kernel/gpu/bus/kern_bus.h b/src/nvidia/inc/kernel/gpu/bus/kern_bus.h
+index afb7d42..8ac4b67 100644
+--- a/src/nvidia/inc/kernel/gpu/bus/kern_bus.h
++++ b/src/nvidia/inc/kernel/gpu/bus/kern_bus.h
+@@ -1,3 +1,73 @@
+ 
+ #include "g_kern_bus_nvoc.h"
+ 
++//
++// Static BAR1 window for GPUs with a small BAR1 (BARLINK_PCIE)
++//
++// The official static BAR1 path (Turing+) maps the entire client-visible
++// FB into BAR1. On GPUs whose BAR1 is smaller than the FB (e.g. 256 MiB
++// BAR1 with 10/20 GiB of VRAM, resizable BAR disabled) that is impossible.
++// Instead of rejecting static BAR1 altogether, only a window is mapped in
++// that case. The window starts at the lowest FB offset that PMA can actually
++// hand out (see _kbusGetStaticBar1FbBase_TU102 and
++// NV_REG_STR_RM_STATIC_BAR1_FB_BASE_MB), not at FB offset 0.
++//
++// KBUS_STATIC_BAR1_MIN_WINDOW_SIZE
++//   Smallest window still considered useful. If less than this remains,
++//   static BAR1 is rejected as before.
++//
++// KBUS_STATIC_BAR1_DYNAMIC_RESERVE
++//   BAR1 VA kept for the dynamic region (CPU mappings outside the window,
++//   on-demand BAR1 P2P mappings via dmaAllocBar1P2PMapping, doorbell and
++//   MMIO priv). This reserve is a chosen value, not a measured one.
++//
++#define KBUS_STATIC_BAR1_MIN_WINDOW_SIZE    (64ULL << 20)
++#define KBUS_STATIC_BAR1_DYNAMIC_RESERVE    (64ULL << 20)
++
++//
++// Both values can be overridden at load time without recompiling, see
++// NV_REG_STR_RM_STATIC_BAR1_WINDOW_MB / NV_REG_STR_RM_STATIC_BAR1_RESERVE_MB
++// in interface/nvrm_registry.h. The regkeys are read in
++// kbusInitRegistryOverrides_IMPL (gpu/bus/kern_bus.c) next to
++// staticBar1ForceType.
++//
++
++// Effective dynamic reserve in bytes (RMStaticBar1ReserveMB, 0 = default)
++#define KBUS_STATIC_BAR1_RESERVE(pKernelBus)                                   \
++    (((pKernelBus)->staticBar1ReserveMB != 0) ?                                \
++        ((NvU64)(pKernelBus)->staticBar1ReserveMB << 20) :                     \
++        KBUS_STATIC_BAR1_DYNAMIC_RESERVE)
++
++// Requested window size in bytes (RMStaticBar1WindowMB, 0 = automatic)
++#define KBUS_STATIC_BAR1_WINDOW_REQ(pKernelBus)                                \
++    ((NvU64)(pKernelBus)->staticBar1WindowMB << 20)
++
++//
++// Requested FB start offset of the window in bytes
++// (RMStaticBar1FbBaseMB, 0 = derive from the FB region table).
++//
++#define KBUS_STATIC_BAR1_FB_BASE_REQ(pKernelBus)                               \
++    ((NvU64)(pKernelBus)->staticBar1FbBaseMB << 20)
++
++//
++// BAR1 VA that must still be available behind the start offset for the
++// 512 MiB align up of the static region to be worth doing. Used identically
++// by kbusInitBar1_GM107 and _kbusGetStaticBar1Offset_TU102.
++//
++#define KBUS_STATIC_BAR1_TAIL_NEED(pKernelBus)                                 \
++    (KBUS_STATIC_BAR1_RESERVE(pKernelBus) +                                    \
++     ((KBUS_STATIC_BAR1_WINDOW_REQ(pKernelBus) != 0) ?                         \
++        KBUS_STATIC_BAR1_WINDOW_REQ(pKernelBus) :                              \
++        KBUS_STATIC_BAR1_MIN_WINDOW_SIZE))
++
++//
++// BARLINK_PCIE: identify a GPU in a log line by RM instance and PCI address.
++// With three GPUs in a rig the RM instance alone is not enough to tell which
++// pair a peer decision belongs to, so every peer log line carries the BDF of
++// both participants.
++//
++#define BARLINK_PCIE_GPU_FMT       "GPU%u[%04x:%02x:%02x.0]"
++#define BARLINK_PCIE_GPU_ARG(pGpu)                                             \
++    gpuGetInstance(pGpu), (NvU32)gpuGetDomain(pGpu),                           \
++    (NvU32)gpuGetBus(pGpu), (NvU32)gpuGetDevice(pGpu)
++
+diff --git a/src/nvidia/interface/nv_uvm_types.h b/src/nvidia/interface/nv_uvm_types.h
+index 92aee61..2568c5c 100644
+--- a/src/nvidia/interface/nv_uvm_types.h
++++ b/src/nvidia/interface/nv_uvm_types.h
+@@ -546,6 +546,14 @@ typedef struct UvmGpuP2PCapsParams_tag
+     NvU64 bar1DmaAddress[2];
+     NvU64 bar1DmaSize[2];
+ 
++    // BARLINK_PCIE: bar1DmaFbBase[i] is the FB physical offset that GPU[1-i]'s
++    // static BAR1 window starts at. The window covers GPU[1-i] FB
++    // [bar1DmaFbBase[i], bar1DmaFbBase[i] + bar1DmaSize[i]) and maps it to
++    // bar1DmaAddress[i], so the peer address of an FB physical address pa is
++    //     bar1DmaAddress[i] + (pa - bar1DmaFbBase[i])
++    // 0 means the window starts at FB offset 0 (stock behaviour).
++    NvU64 bar1DmaFbBase[2];
++
+     // True if GPU i can use PCIe atomics on locations in GPU[i-1]
+     // BAR1. This implies that GPU[i] can issue PCIe atomics,
+     // GPU[i-1] can accept PCIe atomics, and the bus interconnect
+@@ -723,6 +731,9 @@ typedef struct UvmGpuFbInfo_tag
+     NvBool bStaticBar1WriteCombined; // Write combined is enabled
+     NvU64  staticBar1StartOffset;  // The start offset of the the static mapping
+     NvU64  staticBar1Size;     // The size of the static mapping
++    // BARLINK_PCIE: FB physical offset the static mapping starts at. The
++    // window covers FB [staticBar1FbBase, staticBar1FbBase + staticBar1Size).
++    NvU64  staticBar1FbBase;
+     NvU32  heapStart;          // The start offset of heap in KB, helpful for MIG
+                                // systems
+ } UvmGpuFbInfo;
+diff --git a/src/nvidia/interface/nvrm_registry.h b/src/nvidia/interface/nvrm_registry.h
+index 3f23c64..3d3c7d2 100644
+--- a/src/nvidia/interface/nvrm_registry.h
++++ b/src/nvidia/interface/nvrm_registry.h
+@@ -1203,6 +1203,90 @@
+ #define NV_REG_STR_RM_FORCE_STATIC_BAR1_AUTO                      0x00000002
+ #define NV_REG_STR_RM_FORCE_STATIC_BAR1_MAX                       0x00000003
+ 
++//
++// BARLINK_PCIE: knobs for the static BAR1 window used on GPUs whose BAR1 is
++// smaller than the client visible FB. See KBUS_STATIC_BAR1_* in
++// inc/kernel/gpu/bus/kern_bus.h and _kbusGetStaticBar1MapSize_TU102.
++//
++#define NV_REG_STR_RM_STATIC_BAR1_WINDOW_MB                      "RMStaticBar1WindowMB"
++// Type DWORD
++// Encoding Numeric Value
++// Requested size of the static BAR1 window in MiB.
++// 0 (default) - the size is computed automatically: whole client visible FB
++//               if it fits, otherwise BAR1 VA minus start offset minus the
++//               safety margin (userD, MMIO priv, doorbell, dynamic reserve).
++// non zero    - use exactly this size (aligned down to 2 MiB, capped at the
++//               client visible FB size). Static BAR1 is rejected if the
++//               window does not fit into BAR1 at the computed start offset.
++//               An explicit request bypasses KBUS_STATIC_BAR1_MIN_WINDOW_SIZE.
++#define NV_REG_STR_RM_STATIC_BAR1_WINDOW_MB_DEFAULT               0x00000000
++
++#define NV_REG_STR_RM_STATIC_BAR1_RESERVE_MB                     "RMStaticBar1ReserveMB"
++// Type DWORD
++// Encoding Numeric Value
++// BAR1 VA in MiB kept free for the dynamic BAR1 region when the window size
++// is computed automatically. 0 (default) uses
++// KBUS_STATIC_BAR1_DYNAMIC_RESERVE (64 MiB).
++#define NV_REG_STR_RM_STATIC_BAR1_RESERVE_MB_DEFAULT              0x00000000
++
++#define NV_REG_STR_RM_STATIC_BAR1_FB_BASE_MB                     "RMStaticBar1FbBaseMB"
++// Type DWORD
++// Encoding Numeric Value
++// FB offset in MiB at which the static BAR1 window starts.
++// 0 (default) - determined at runtime from pMemoryManager->Ram.fbRegion[]:
++//               the base of the first region that is neither bRsvdRegion nor
++//               bInternalHeap. Only such regions are registered with PMA
++//               (mem_mgr.c, _pmaInitFbRegions skips internal and reserved
++//               regions), so only they can ever back a cudaMalloc. Regions
++//               below it (console / display / link training buffer; region 0
++//               on the GPUs looked at so far) are never handed to clients, so
++//               a window placed over them cannot carry user data.
++// non zero    - use exactly this FB offset (aligned up to 2 MiB). Intended
++//               for sweeping the window across FB while measuring.
++#define NV_REG_STR_RM_STATIC_BAR1_FB_BASE_MB_DEFAULT              0x00000000
++// 0xFFFFFFFF   - force FB offset 0, i.e. the behaviour before the window was
++//               moved off the console region. Only useful for A/B measurements;
++//               on a GPU whose BAR1 does not cover the whole FB the resulting
++//               window contains no memory PMA can hand out.
++#define NV_REG_STR_RM_STATIC_BAR1_FB_BASE_MB_FORCE_ZERO           0xFFFFFFFF
++
++#define NV_REG_STR_RM_STATIC_BAR1_LOCAL_FORCE                    "RMStaticBar1LocalForce"
++// Type DWORD
++// Encoding: same values as NV_REG_STR_RM_FORCE_STATIC_BAR1
++//   0 DISABLE, 1 ENABLE, 2 AUTO
++// Overrides staticBar1ForceType in kernel RM only. Every registry key is
++// packaged by RmPackageRegistry() (arch/nvalloc/unix/src/registry.c) and
++// handed to GSP-RM in _kgspPrepareRegistry() (gpu/gsp/kernel_gsp.c), so
++// setting NV_REG_STR_RM_FORCE_STATIC_BAR1 also reaches the GSP firmware,
++// whose own unpatched kbusIsStaticBar1Supported_TU102 rejects a BAR1 that is
++// smaller than the FB and thereby fails GSP-RM init. GSP-RM does not know
++// this key name and ignores it.
++#define NV_REG_STR_RM_STATIC_BAR1_LOCAL_FORCE_UNSET               0xFFFFFFFF
++
++#define NV_REG_STR_BARLINK_PEER_BAR1                             "BarlinkPeerBar1"
++#define NV_REG_STR_BARLINK_PEER_BAR1_LEGACY                      "RMSmallBarP2PPeerBar1"
++// The LEGACY spelling is the name this key carried before the transport
++// was renamed from HTCCL to barlink. It is read as a fallback only, so a
++// driver already loaded and configured on a rig keeps working; new setups
++// should set BarlinkPeerBar1.
++// Type DWORD
++// Encoding Numeric Value
++// Gates the second relaxation in osCheckGpuBarsOverlapAddrRange
++// (arch/nvalloc/unix/src/osmemdesc.c).
++// 0 (default) - the guard behaves exactly as shipped, apart from the static
++//               BAR1 relaxation, which is itself gated on an active static
++//               BAR1 window and therefore inactive without RMForceStaticBar1.
++// 1           - additionally allow a usermode I/O memory registration whose
++//               whole range lies inside the PCI BAR1 aperture of a DIFFERENT
++//               attached GPU. No static BAR1 required.
++//               This is what the dma-buf path needs: the exporting GPU maps
++//               the exported buffer into its BAR1 on demand
++//               (rm_dma_buf_map_mem_handle -> kbusMapFbAperture_HAL,
++//               arch/nvalloc/unix/src/osapi.c:5797), so the resulting bus
++//               address is somewhere in BAR1 and not in any fixed window.
++#define NV_REG_STR_BARLINK_PEER_BAR1_DISABLE              0x00000000
++#define NV_REG_STR_BARLINK_PEER_BAR1_ENABLE               0x00000001
++
+ #define NV_REG_STR_RM_BAR2_APERTURE_SIZE_MB                  "RMBar2ApertureSizeMB"
+ // Type DWORD
+ // Encoding Numeric Value
+diff --git a/src/nvidia/src/kernel/gpu/bus/arch/hopper/kern_bus_gh100.c b/src/nvidia/src/kernel/gpu/bus/arch/hopper/kern_bus_gh100.c
+index 01f08ca..6ec8014 100644
+--- a/src/nvidia/src/kernel/gpu/bus/arch/hopper/kern_bus_gh100.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/hopper/kern_bus_gh100.c
+@@ -822,6 +822,23 @@ kbusCreateP2PMapping_GH100
+     NvU32      attributes
+ )
+ {
++    //
++    // BARLINK_PCIE: same log line as in kbusCreateP2PMapping_GP100. Blackwell
++    // (GB202) is dispatched here, Ampere (GA102) through the GP100 variant, so
++    // both need the print to see the chosen connection type for a mixed pair.
++    //
++    NV_PRINTF(LEVEL_ERROR,
++              "BARLINK_PCIE: createP2PMapping(GH100) " BARLINK_PCIE_GPU_FMT " -> "
++              BARLINK_PCIE_GPU_FMT " : connectionType=%u attributes=0x%08x "
++              "(nvlink=%u nvlinkIndirect=%u pcieMailbox=%u pcieBar1=%u c2c=%u)\n",
++              BARLINK_PCIE_GPU_ARG(pGpu0), BARLINK_PCIE_GPU_ARG(pGpu1),
++              DRF_VAL(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, attributes), attributes,
++              FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _NVLINK, attributes),
++              FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _NVLINK_INDIRECT, attributes),
++              FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE, attributes),
++              FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE_BAR1, attributes),
++              FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _C2C, attributes));
++
+     if (FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _C2C, attributes))
+     {
+         return kbusCreateP2PMappingForC2C_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, peer0, peer1, attributes);
+@@ -1455,24 +1472,50 @@ kbusIsPcieBar1P2PMappingSupported_GH100
+     NvU32      gpuInst0   = gpuGetInstance(pGpu0);
+     NvU32      gpuInst1   = gpuGetInstance(pGpu1);
+     KernelBif *pKernelBif = GPU_GET_KERNEL_BIF(pGpu0);
++    NvBool     bStatic0;
++    NvBool     bStatic1;
+ 
+     // Only support if available by default, or if forced by regkey.
+     if ((pKernelBif->pcieP2PType != NV_REG_STR_RM_PCIEP2P_TYPE_BAR1) &&
+         !pKernelBus0->getProperty(pKernelBus0, PDB_PROP_KBUS_SUPPORT_BAR1_P2P_BY_DEFAULT))
+     {
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: bar1P2PSupported " BARLINK_PCIE_GPU_FMT " -> "
++                  BARLINK_PCIE_GPU_FMT " : NO, reason=REGKEY_AND_PDB "
++                  "(pcieP2PType=%u, need BAR1=%u; PDB_PROP_KBUS_SUPPORT_BAR1_P2P_BY_DEFAULT=%u)\n",
++                  BARLINK_PCIE_GPU_ARG(pGpu0), BARLINK_PCIE_GPU_ARG(pGpu1),
++                  pKernelBif->pcieP2PType, NV_REG_STR_RM_PCIEP2P_TYPE_BAR1,
++                  pKernelBus0->getProperty(pKernelBus0, PDB_PROP_KBUS_SUPPORT_BAR1_P2P_BY_DEFAULT));
+         return NV_FALSE;
+     }
+ 
+     // Not loopback support
+     if (pGpu0 == pGpu1)
+     {
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: bar1P2PSupported " BARLINK_PCIE_GPU_FMT " -> "
++                  BARLINK_PCIE_GPU_FMT " : NO, reason=LOOPBACK\n",
++                  BARLINK_PCIE_GPU_ARG(pGpu0), BARLINK_PCIE_GPU_ARG(pGpu1));
+         return NV_FALSE;
+     }
+ 
+     // Both of GPUs need to have the static bar1 enabled
+-    if (!kbusIsStaticBar1Enabled(pGpu0, pKernelBus0) ||
+-        !kbusIsStaticBar1Enabled(pGpu1, pKernelBus1))
++    bStatic0 = kbusIsStaticBar1Enabled(pGpu0, pKernelBus0);
++    bStatic1 = kbusIsStaticBar1Enabled(pGpu1, pKernelBus1);
++
++    if (!bStatic0 || !bStatic1)
+     {
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: bar1P2PSupported " BARLINK_PCIE_GPU_FMT " -> "
++                  BARLINK_PCIE_GPU_FMT " : NO, reason=STATIC_BAR1 "
++                  "(staticBar1 local=%u size=0x%llx off=0x%llx | remote=%u size=0x%llx off=0x%llx)\n",
++                  BARLINK_PCIE_GPU_ARG(pGpu0), BARLINK_PCIE_GPU_ARG(pGpu1),
++                  bStatic0,
++                  pKernelBus0->bar1[GPU_GFID_PF].staticBar1.size,
++                  pKernelBus0->bar1[GPU_GFID_PF].staticBar1.startOffset,
++                  bStatic1,
++                  pKernelBus1->bar1[GPU_GFID_PF].staticBar1.size,
++                  pKernelBus1->bar1[GPU_GFID_PF].staticBar1.startOffset);
+         return NV_FALSE;
+     }
+ 
+@@ -1485,9 +1528,33 @@ kbusIsPcieBar1P2PMappingSupported_GH100
+     if ((pKernelBus0->p2pPcie.peerNumberMask[gpuInst1] != 0) ||
+         (pKernelBus1->p2pPcie.peerNumberMask[gpuInst0] != 0))
+     {
++        //
++        // BARLINK_PCIE: this is the chicken-and-egg exit. As soon as a mailbox
++        // P2P object exists for this pair (which is what ForceP2P provokes,
++        // because the mailbox caps then come back OK and CUDA creates a
++        // PCIE_PROPRIETARY connection first), BAR1 P2P is locked out for the
++        // rest of the driver's life.
++        //
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: bar1P2PSupported " BARLINK_PCIE_GPU_FMT " -> "
++                  BARLINK_PCIE_GPU_FMT " : NO, reason=MAILBOX_P2P_ALREADY_UP "
++                  "(peerNumberMask fwd[%u]=0x%x, rev[%u]=0x%x)\n",
++                  BARLINK_PCIE_GPU_ARG(pGpu0), BARLINK_PCIE_GPU_ARG(pGpu1),
++                  gpuInst1, pKernelBus0->p2pPcie.peerNumberMask[gpuInst1],
++                  gpuInst0, pKernelBus1->p2pPcie.peerNumberMask[gpuInst0]);
+         return NV_FALSE;
+     }
+ 
++    NV_PRINTF(LEVEL_ERROR,
++              "BARLINK_PCIE: bar1P2PSupported " BARLINK_PCIE_GPU_FMT " -> "
++              BARLINK_PCIE_GPU_FMT " : YES (pcieP2PType=%u, byDefaultPdb=%u, "
++              "staticBar1 local size=0x%llx, remote size=0x%llx)\n",
++              BARLINK_PCIE_GPU_ARG(pGpu0), BARLINK_PCIE_GPU_ARG(pGpu1),
++              pKernelBif->pcieP2PType,
++              pKernelBus0->getProperty(pKernelBus0, PDB_PROP_KBUS_SUPPORT_BAR1_P2P_BY_DEFAULT),
++              pKernelBus0->bar1[GPU_GFID_PF].staticBar1.size,
++              pKernelBus1->bar1[GPU_GFID_PF].staticBar1.size);
++
+     return NV_TRUE;
+ }
+ 
+@@ -1580,15 +1647,35 @@ _kbusCreateStaticBar1IOMMUMapping
+     memdescGetPtePhysAddrsForGpu(pPeerDmaMemDesc, pSrcGpu,
+                                  AT_GPU, 0, 0, 1, &peerDmaAddr);
+ 
++    //
+     // Check the if it is aligned to max RM_PAGE_SIZE 512M.
+-    if (!NV_IS_ALIGNED64(peerDmaAddr, RM_PAGE_SIZE_512M))
++    //
++    // BARLINK_PCIE: the 512 MiB requirement exists because the static
++    // region may be mapped with pages of up to 512 MiB. When a window is in
++    // use (start not 512 MiB aligned, or window smaller than 512 MiB) the
++    // region is mapped with 2 MiB pages instead
++    // (BUS_MAP_FB_FLAGS_PAGE_SIZE_2M in kbusEnableStaticBar1Mapping_TU102),
++    // so 2 MiB alignment is sufficient.
++    //
+     {
+-        NV_PRINTF(LEVEL_ERROR, "The peer DMA address 0x%llx is not aligned at 0x%llx\n",
+-                               peerDmaAddr, RM_PAGE_SIZE_512M);
++        NvU64 alignment = RM_PAGE_SIZE_512M;
++
++        if (!NV_IS_ALIGNED64(pPeerKernelBus->bar1[peerGpuGfid].staticBar1.startOffset,
++                             RM_PAGE_SIZE_512M) ||
++            (pPeerKernelBus->bar1[peerGpuGfid].staticBar1.size < RM_PAGE_SIZE_512M))
++        {
++            alignment = RM_PAGE_SIZE_2M;
++        }
+ 
+-        memdescUnmapIommu(pPeerDmaMemDesc, pSrcGpu->busInfo.iovaspaceId);
++        if (!NV_IS_ALIGNED64(peerDmaAddr, alignment))
++        {
++            NV_PRINTF(LEVEL_ERROR, "The peer DMA address 0x%llx is not aligned at 0x%llx\n",
++                                   peerDmaAddr, alignment);
+ 
+-        return NV_ERR_INVALID_ADDRESS;
++            memdescUnmapIommu(pPeerDmaMemDesc, pSrcGpu->busInfo.iovaspaceId);
++
++            return NV_ERR_INVALID_ADDRESS;
++        }
+     }
+ 
+     return NV_OK;
+diff --git a/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c b/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
+index ac3584f..a6e83a0 100644
+--- a/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
+@@ -1160,7 +1160,36 @@ kbusInitBar1_GM107(OBJGPU *pGpu, KernelBus *pKernelBus, NvU32 gfid)
+         // This up to (but not including) 512MB of BAR1 space will still be allocatable in
+         // the dynamic region
+         //
+-        NvU64 bar1Offset = NV_ALIGN_UP(consoleSize + pKernelBus->p2pPcie.writeMailboxTotalSize, RM_PAGE_SIZE_512M);
++        // BARLINK_PCIE: on GPUs with a small BAR1 (e.g. 256 MiB) the 512 MiB
++        // align-up consumes the entire BAR. It is therefore only applied if
++        // the reserve for the dynamic region and a minimum window still fit
++        // into BAR1 afterwards. Otherwise align up to 2 MiB, which is the
++        // page size kbusEnableStaticBar1Mapping_TU102 uses for the static
++        // region (BUS_MAP_FB_FLAGS_PAGE_SIZE_2M). 512 MiB pages are then not
++        // possible, which is moot for a window of that size anyway.
++        //
++        // This computation must match _kbusGetStaticBar1Offset_TU102 in
++        // kern_bus_tu102.c.
++        //
++        NvU64 bar1RawStart = consoleSize + pKernelBus->p2pPcie.writeMailboxTotalSize;
++        NvU64 bar1VASizeAligned = RM_ALIGN_DOWN(pKernelBus->bar1[gfid].mappableLength,
++                                                RM_PAGE_SIZE_2M);
++        NvU64 bar1Offset = NV_ALIGN_UP64(bar1RawStart, RM_PAGE_SIZE_512M);
++
++        if ((bar1Offset + KBUS_STATIC_BAR1_TAIL_NEED(pKernelBus)) > bar1VASizeAligned)
++        {
++            bar1Offset = NV_ALIGN_UP64(bar1RawStart, RM_PAGE_SIZE_2M);
++
++            NV_PRINTF(LEVEL_ERROR, "BARLINK_PCIE: small BAR1 (VA 0x%llx): static BAR1 start "
++                                   "aligned to 2MB instead of 512MB, offset 0x%llx\n",
++                                   bar1VASizeAligned, bar1Offset);
++        }
++
++        NV_PRINTF(LEVEL_ERROR, "BARLINK_PCIE: BAR1 VA 0x%llx, console 0x%llx, mailbox 0x%llx, "
++                               "static BAR1 start offset 0x%llx\n",
++                               bar1VASizeAligned, consoleSize,
++                               pKernelBus->p2pPcie.writeMailboxTotalSize, bar1Offset);
++
+         // Enable the static BAR1 mapping for the BAR1 P2P
+         NV_ASSERT_OK_OR_GOTO(rmStatus,
+                              kbusEnableStaticBar1Mapping_HAL(pGpu, pKernelBus, gfid, bar1Offset),
+diff --git a/src/nvidia/src/kernel/gpu/bus/arch/pascal/kern_bus_gp100.c b/src/nvidia/src/kernel/gpu/bus/arch/pascal/kern_bus_gp100.c
+index 46e22b0..c220ed2 100644
+--- a/src/nvidia/src/kernel/gpu/bus/arch/pascal/kern_bus_gp100.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/pascal/kern_bus_gp100.c
+@@ -59,12 +59,41 @@ kbusCreateP2PMapping_GP100
+     NvU32      attributes
+ )
+ {
++    //
++    // BARLINK_PCIE: this is the point where it becomes visible which
++    // connection type p2pGetCapsStatus actually decided on for this pair.
++    // CONNECTION_TYPE 3 == PCIE (mailbox), 4 == PCIE_BAR1, see
++    // NV_P2PAPI_ATTRIBUTES_CONNECTION_TYPE_* in class/cl503b.h.
++    //
++    NV_PRINTF(LEVEL_ERROR,
++              "BARLINK_PCIE: createP2PMapping(GP100) " BARLINK_PCIE_GPU_FMT " -> "
++              BARLINK_PCIE_GPU_FMT " : connectionType=%u attributes=0x%08x "
++              "(nvlink=%u nvlinkIndirect=%u pcieMailbox=%u pcieBar1=%u c2c=%u)\n",
++              BARLINK_PCIE_GPU_ARG(pGpu0), BARLINK_PCIE_GPU_ARG(pGpu1),
++              DRF_VAL(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, attributes), attributes,
++              FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _NVLINK, attributes),
++              FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _NVLINK_INDIRECT, attributes),
++              FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE, attributes),
++              FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE_BAR1, attributes),
++              FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _C2C, attributes));
++
+     if (FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _NVLINK, attributes) ||
+         FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _NVLINK_INDIRECT, attributes))
+     {
+         return kbusCreateP2PMappingForNvlink_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, peer0, peer1, attributes);
+     }
+ 
++    //
++    // BARLINK_PCIE: pre-Hopper this dispatch for BAR1 P2P was missing.
++    // Without it p2pCaps does report PCI_BAR1_SUPPORTED, but creating the
++    // connection fails with NV_ERR_NOT_SUPPORTED. The counterpart is
++    // kbusCreateP2PMapping_GH100.
++    //
++    if (FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE_BAR1, attributes))
++    {
++        return kbusCreateP2PMappingForBar1P2P_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, attributes);
++    }
++
+     if (FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE, attributes))
+     {
+         return kbusCreateP2PMappingForMailbox_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, peer0, peer1, attributes);
+@@ -632,6 +661,12 @@ kbusRemoveP2PMapping_GP100
+         return kbusRemoveP2PMappingForNvlink_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, peer0, peer1, attributes);
+     }
+ 
++    // BARLINK_PCIE: counterpart to the dispatch in kbusCreateP2PMapping_GP100
++    if (FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE_BAR1, attributes))
++    {
++        return kbusRemoveP2PMappingForBar1P2P_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, attributes);
++    }
++
+     if (FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE, attributes))
+     {
+         return kbusRemoveP2PMappingForMailbox_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, peer0, peer1, attributes);
+diff --git a/src/nvidia/src/kernel/gpu/bus/arch/turing/kern_bus_tu102.c b/src/nvidia/src/kernel/gpu/bus/arch/turing/kern_bus_tu102.c
+index f06fb09..5422bc4 100644
+--- a/src/nvidia/src/kernel/gpu/bus/arch/turing/kern_bus_tu102.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/turing/kern_bus_tu102.c
+@@ -350,6 +350,451 @@ kbusGetBar1ResvdVA_TU102
+ }
+ 
+ 
++/*!
++ * @brief BARLINK_PCIE: lowest FB offset that a client allocation can land on
++ *
++ * A window that covers FB the client never gets is useless. Which FB a client
++ * can get is decided by the FB region table: _pmaInitFbRegions
++ * (gpu/mem_mgr/mem_mgr.c) registers a region with PMA only if it is neither
++ * bInternalHeap nor bRsvdRegion; everything else is skipped and can never be
++ * returned by cudaMalloc. The regions below the first PMA region are the
++ * console / display / link training reservations.
++ *
++ * The table must not be hardcoded: on GSP GPUs it is built from the firmware
++ * region list in memmgrInitBaseFbRegions_FWCLIENT
++ * (gpu/mem_mgr/mem_mgr_gsp_client.c), so it depends on board, VBIOS and GSP
++ * version. It is therefore read here at runtime.
++ *
++ * Ordering, checked in this tree:
++ *   - memmgrStatePreInitLocked_IMPL (gpu/mem_mgr/mem_mgr.c:365) calls
++ *     memmgrInitFbRegions() for GSP clients, which fills base/limit and
++ *     bRsvdRegion from the GSP static info.
++ *   - memmgrStateInitLocked_IMPL (gpu/mem_mgr/mem_mgr.c) reserves the console
++ *     region and then calls memmgrCreateHeap() -> heapInit()
++ *     (gpu/mem_mgr/heap.c:544) -> memmgrRegionSetupForPma() ->
++ *     memmgrRegionSetupCommon_IMPL (gpu/mem_mgr/mem_mgr_regions.c:282), which
++ *     sets bInternalHeap.
++ *   - kbusInitBar1_GM107, from which this code runs, is called by
++ *     kbusStatePostLoad_GM107 (gpu/bus/arch/maxwell/kern_bus_gm107.c:692).
++ *     STATE_POST_LOAD runs after STATE_INIT for all engines
++ *     (gpuStateLoad_IMPL -> gpuStatePostLoad, gpu/gpu.c:2689).
++ * So both flags are final by the time this function runs. If the table is
++ * nevertheless empty, this is reported and 0 is returned.
++ *
++ * @param[in]  pGpu
++ * @param[in]  pKernelBus
++ * @param[out] pbFromRegkey  set if the value came from
++ *                           NV_REG_STR_RM_STATIC_BAR1_FB_BASE_MB
++ *
++ * @return FB offset in bytes, aligned up to 2 MiB
++ */
++static NvU64
++_kbusGetStaticBar1FbBase_TU102
++(
++    OBJGPU     *pGpu,
++    KernelBus  *pKernelBus,
++    NvBool     *pbFromRegkey
++)
++{
++    MemoryManager *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
++    NvU64          requestedBase  = KBUS_STATIC_BAR1_FB_BASE_REQ(pKernelBus);
++    NvU64          fbBase         = 0;
++    NvBool         bFound         = NV_FALSE;
++    NvU32          i;
++
++    if (pbFromRegkey != NULL)
++    {
++        *pbFromRegkey = NV_FALSE;
++    }
++
++    if (pKernelBus->staticBar1FbBaseMB == NV_REG_STR_RM_STATIC_BAR1_FB_BASE_MB_FORCE_ZERO)
++    {
++        //
++        // Explicit request for the old behaviour (window at FB offset 0) so
++        // the two placements can be compared without rebuilding.
++        //
++        if (pbFromRegkey != NULL)
++        {
++            *pbFromRegkey = NV_TRUE;
++        }
++
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: static BAR1 FB base forced to 0 by regkey "
++                  "RMStaticBar1FbBaseMB=0x%x. The window then covers the "
++                  "console/display reservation, which PMA never hands out.\n",
++                  pKernelBus->staticBar1FbBaseMB);
++
++        return 0;
++    }
++
++    if (requestedBase != 0)
++    {
++        fbBase = NV_ALIGN_UP64(requestedBase, RM_PAGE_SIZE_2M);
++
++        if (pbFromRegkey != NULL)
++        {
++            *pbFromRegkey = NV_TRUE;
++        }
++
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: static BAR1 FB base 0x%llx from regkey "
++                  "RMStaticBar1FbBaseMB=%u\n",
++                  fbBase, pKernelBus->staticBar1FbBaseMB);
++
++        return fbBase;
++    }
++
++    if ((pMemoryManager == NULL) || (pMemoryManager->Ram.numFBRegions == 0))
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: FB region table not available at static BAR1 setup "
++                  "(pMemoryManager %p, numFBRegions %u), falling back to FB base 0. "
++                  "The window will most likely not be usable for client data.\n",
++                  pMemoryManager,
++                  (pMemoryManager != NULL) ? pMemoryManager->Ram.numFBRegions : 0);
++        return 0;
++    }
++
++    for (i = 0; i < pMemoryManager->Ram.numFBRegions; i++)
++    {
++        const FB_REGION_DESCRIPTOR *pRegion = &pMemoryManager->Ram.fbRegion[i];
++
++        //
++        // Same predicate as _pmaInitFbRegions in gpu/mem_mgr/mem_mgr.c:
++        // internal or reserved regions are never registered with PMA.
++        //
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: fbRegion[%u] base 0x%llx limit 0x%llx rsvdSize 0x%llx "
++                  "bRsvdRegion %u bInternalHeap %u%s\n",
++                  i, pRegion->base, pRegion->limit, pRegion->rsvdSize,
++                  pRegion->bRsvdRegion, pRegion->bInternalHeap,
++                  (!bFound && !pRegion->bRsvdRegion && !pRegion->bInternalHeap) ?
++                      "  <- first PMA region" : "");
++
++        if (bFound || pRegion->bRsvdRegion || pRegion->bInternalHeap)
++        {
++            continue;
++        }
++
++        fbBase = pRegion->base;
++        bFound = NV_TRUE;
++    }
++
++    if (!bFound)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: no FB region is free of bRsvdRegion/bInternalHeap, "
++                  "falling back to FB base 0\n");
++        return 0;
++    }
++
++    fbBase = NV_ALIGN_UP64(fbBase, RM_PAGE_SIZE_2M);
++
++    NV_PRINTF(LEVEL_ERROR,
++              "BARLINK_PCIE: static BAR1 FB base 0x%llx from FB region table "
++              "(%u regions)\n",
++              fbBase, pMemoryManager->Ram.numFBRegions);
++
++    return fbBase;
++}
++
++/*!
++ * @brief BARLINK_PCIE: does one chunk of a memdesc fall inside the window
++ *
++ * The window covers FB [fbBase, fbBase + winSize). Written with subtraction
++ * only so it cannot underflow or overflow.
++ */
++static NvBool
++_kbusIsChunkInStaticBar1Window_TU102
++(
++    MEMORY_DESCRIPTOR  *pMemDesc,
++    ADDRESS_TRANSLATION addressTranslation,
++    NvU64               offset,
++    NvU64               chunk,
++    NvU64               fbBase,
++    NvU64               winSize
++)
++{
++    NvU64 physAddr = memdescGetPhysAddr(pMemDesc, addressTranslation, offset);
++
++    if ((physAddr < fbBase) || (chunk > winSize))
++    {
++        return NV_FALSE;
++    }
++
++    return ((physAddr - fbBase) <= (winSize - chunk));
++}
++
++/*!
++ * @brief BARLINK_PCIE: is the memdesc entirely inside the static BAR1 window
++ *
++ * With a window that neither starts at FB offset 0 nor covers the whole FB,
++ * "BAR1 VA = physAddr - fbBase + startOffset" is only defined for physical
++ * addresses inside [fbBase, fbBase + size). Everything else must go through
++ * the dynamic BAR1 region.
++ */
++static NvBool
++_kbusIsInStaticBar1Window_TU102
++(
++    OBJGPU             *pGpu,
++    KernelBus          *pKernelBus,
++    NvU32               gfid,
++    MEMORY_DESCRIPTOR  *pMemDesc,
++    NvBool              bFullScan
++)
++{
++    NvU64               fbBase   = pKernelBus->bar1[gfid].staticBar1.fbBase;
++    NvU64               winSize  = pKernelBus->bar1[gfid].staticBar1.size;
++    OBJVASPACE         *pVAS     = pKernelBus->bar1[gfid].pVAS;
++    ADDRESS_TRANSLATION addressTranslation;
++    NvU64               mapSize;
++    NvU64               pageSize;
++    NvU64               granularity;
++    NvU64               offset;
++    NvU64               lastOffset;
++
++    if ((pMemDesc == NULL) || (pVAS == NULL) || (winSize == 0))
++    {
++        return NV_FALSE;
++    }
++
++    if (memdescGetAddressSpace(pMemDesc) != ADDR_FBMEM)
++    {
++        return NV_FALSE;
++    }
++
++    addressTranslation = VAS_ADDRESS_TRANSLATION(pVAS);
++    mapSize            = memdescGetSize(pMemDesc);
++    pageSize           = memdescGetPageSize(pMemDesc, addressTranslation);
++
++    if (mapSize == 0)
++    {
++        return NV_FALSE;
++    }
++
++    granularity = memdescGetContiguity(pMemDesc, addressTranslation) ?
++                      mapSize : ((pageSize != 0) ? pageSize : RM_PAGE_SIZE);
++
++    if (bFullScan)
++    {
++        for (offset = 0; offset < mapSize; offset += granularity)
++        {
++            if (!_kbusIsChunkInStaticBar1Window_TU102(pMemDesc, addressTranslation,
++                                                      offset,
++                                                      NV_MIN(granularity, mapSize - offset),
++                                                      fbBase, winSize))
++            {
++                return NV_FALSE;
++            }
++        }
++
++        return NV_TRUE;
++    }
++
++    //
++    // Quick variant: first and last chunk only. Used on the allocation hot
++    // path (kbusIncreaseStaticBar1Refcount_TU102), where walking every page
++    // of a large discontiguous memdesc would be pointlessly expensive. The
++    // authoritative full check happens in _kbusUpdateStaticBar1VAMapping_TU102,
++    // which has to walk every page anyway, and in kbusGetStaticFbAperture_TU102.
++    //
++    lastOffset = RM_ALIGN_DOWN(mapSize - 1, granularity);
++
++    return _kbusIsChunkInStaticBar1Window_TU102(pMemDesc, addressTranslation, 0,
++                                                NV_MIN(granularity, mapSize),
++                                                fbBase, winSize) &&
++           _kbusIsChunkInStaticBar1Window_TU102(pMemDesc, addressTranslation,
++                                                lastOffset, mapSize - lastOffset,
++                                                fbBase, winSize);
++}
++
++/*!
++ * @brief BARLINK_PCIE: determine the size of the static BAR1 window
++ *
++ * If BAR1 is large enough for the client-visible FB above fbBase, all of it
++ * is mapped as before. If it is not, a window is mapped:
++ *
++ *   window = BAR1 VA (2M aligned down) - bar1Offset - safety margin
++ *
++ * safety margin = UserD mappings for all channels + MMIO priv + doorbell
++ *                 + KBUS_STATIC_BAR1_DYNAMIC_RESERVE
++ * These are the same items the AUTO branch of
++ * kbusIsStaticBar1Supported_TU102 adds up, plus the fixed reserve for the
++ * dynamic BAR1 region.
++ *
++ * The result is aligned down to RM_PAGE_SIZE_2M (static BAR1 is mapped
++ * with 2 MiB pages). If it falls below KBUS_STATIC_BAR1_MIN_WINDOW_SIZE,
++ * 0 is returned and the caller rejects static BAR1.
++ *
++ * Both the window size and the dynamic reserve can be overridden at load
++ * time, see NV_REG_STR_RM_STATIC_BAR1_WINDOW_MB and
++ * NV_REG_STR_RM_STATIC_BAR1_RESERVE_MB. An explicit window size is used as
++ * given (aligned down to 2 MiB, capped at the client visible FB size) and
++ * bypasses KBUS_STATIC_BAR1_MIN_WINDOW_SIZE, so values can be swept without
++ * recompiling. It is rejected only if it does not fit into BAR1 behind
++ * bar1Offset.
++ *
++ * The window maps FB starting at fbBase, see _kbusGetStaticBar1FbBase_TU102.
++ *
++ * @param[in] pGpu
++ * @param[in] pKernelBus
++ * @param[in] gfid
++ * @param[in] bar1Offset  start offset of the static region within BAR1
++ * @param[in] fbBase      FB offset the window starts at
++ *
++ * @return size to map in bytes, or 0 if too little space remains
++ */
++static NvU64
++_kbusGetStaticBar1MapSize_TU102
++(
++    OBJGPU     *pGpu,
++    KernelBus  *pKernelBus,
++    NvU32       gfid,
++    NvU64       bar1Offset,
++    NvU64       fbBase
++)
++{
++    MemoryManager *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
++    KernelFifo    *pKernelFifo    = GPU_GET_KERNEL_FIFO(pGpu);
++    NvU64 clientFbSize = memmgrGetClientFbAddrSpaceSize(pGpu, pMemoryManager);
++    //
++    // BARLINK_PCIE: only the client visible FB above fbBase can be mapped,
++    // everything below is console/display/RM reserved and never handed out.
++    //
++    NvU64 fullMapSize = (clientFbSize > fbBase) ?
++                            RM_ALIGN_DOWN(clientFbSize - fbBase, RM_PAGE_SIZE_2M) : 0;
++    NvU64 bar1VASizeAligned = RM_ALIGN_DOWN(pKernelBus->bar1[gfid].mappableLength,
++                                            RM_PAGE_SIZE_2M);
++    NvU64 dynamicReserve = KBUS_STATIC_BAR1_RESERVE(pKernelBus);
++    NvU64 requestedSize   = KBUS_STATIC_BAR1_WINDOW_REQ(pKernelBus);
++    NvU64 reserved;
++    NvU64 windowSize;
++    NvU64 dynamicAbove;
++    NvU32 userdSize   = 0;
++    NvU32 numChannels = kfifoGetMaxChannelsInSystem(pGpu, pKernelFifo);
++
++    kfifoGetUserdSizeAlign_HAL(pKernelFifo, &userdSize, NULL);
++
++    reserved  = (NvU64)userdSize * numChannels;
++    reserved += 16 * RM_PAGE_SIZE;                  // MMIO priv
++    reserved += 16 * RM_PAGE_SIZE;                  // doorbell
++    reserved += dynamicReserve;
++
++    if (fullMapSize == 0)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: FB base 0x%llx is at or above the client visible FB "
++                  "0x%llx, no static BAR1 window possible\n",
++                  fbBase, clientFbSize);
++        return 0;
++    }
++
++    if (requestedSize != 0)
++    {
++        //
++        // Explicit size from NV_REG_STR_RM_STATIC_BAR1_WINDOW_MB. Honoured as
++        // given so the value can be swept, only capped at the client visible
++        // FB size. KBUS_STATIC_BAR1_MIN_WINDOW_SIZE is deliberately not
++        // applied here.
++        //
++        windowSize = RM_ALIGN_DOWN(requestedSize, RM_PAGE_SIZE_2M);
++
++        if (windowSize > fullMapSize)
++        {
++            windowSize = fullMapSize;
++        }
++
++        if ((windowSize == 0) || ((bar1Offset + windowSize) > bar1VASizeAligned))
++        {
++            NV_PRINTF(LEVEL_ERROR, "BARLINK_PCIE: requested static BAR1 window 0x%llx does not "
++                                   "fit at offset 0x%llx into BAR1 VA 0x%llx\n",
++                                   windowSize, bar1Offset, bar1VASizeAligned);
++            windowSize = 0;
++        }
++    }
++    else if ((bar1Offset + fullMapSize) <= bar1VASizeAligned)
++    {
++        // Everything fits, so map the entire client-visible FB as before
++        windowSize = fullMapSize;
++    }
++    else if ((bar1Offset + reserved) >= bar1VASizeAligned)
++    {
++        windowSize = 0;
++    }
++    else
++    {
++        windowSize = RM_ALIGN_DOWN(bar1VASizeAligned - bar1Offset - reserved,
++                                   RM_PAGE_SIZE_2M);
++
++        if (windowSize > fullMapSize)
++        {
++            windowSize = fullMapSize;
++        }
++
++        if (windowSize < KBUS_STATIC_BAR1_MIN_WINDOW_SIZE)
++        {
++            windowSize = 0;
++        }
++    }
++
++    dynamicAbove = ((windowSize != 0) &&
++                    (bar1VASizeAligned > (bar1Offset + windowSize))) ?
++                       (bar1VASizeAligned - bar1Offset - windowSize) : 0;
++
++    //
++    // LEVEL_ERROR on purpose: these numbers are needed for diagnosis without
++    // raising the debug level.
++    //
++    NV_PRINTF(LEVEL_ERROR,
++              "BARLINK_PCIE: BAR1 VA 0x%llx, client FB 0x%llx, FB base 0x%llx, "
++              "mappable above base 0x%llx, offset 0x%llx, "
++              "userD 0x%llx (%u ch * %u B), reserve 0x%llx, margin 0x%llx, "
++              "window 0x%llx [FB 0x%llx..0x%llx), dynamic below 0x%llx, "
++              "dynamic above 0x%llx\n",
++              bar1VASizeAligned, clientFbSize, fbBase, fullMapSize, bar1Offset,
++              (NvU64)userdSize * numChannels, numChannels, userdSize,
++              dynamicReserve, reserved, windowSize, fbBase, fbBase + windowSize,
++              bar1Offset, dynamicAbove);
++
++    return windowSize;
++}
++
++/*!
++ * @brief BARLINK_PCIE: predict the start offset of the static region in BAR1
++ *
++ * Must match the computation in kbusInitBar1_GM107: align up to 512 MiB
++ * only if the reserve plus the minimum window still fit into BAR1
++ * afterwards, otherwise align up to 2 MiB.
++ *
++ * BARLINK_PCIE: this is purely a BAR1 VA layout question - the console and
++ * mailbox mappings sit at the bottom of BAR1 and the static region follows
++ * them. It does not depend on which FB offset the window maps
++ * (_kbusGetStaticBar1FbBase_TU102), so no fbBase parameter is taken here.
++ * The two are combined in kbusEnableStaticBar1Mapping_TU102:
++ *     BAR1 VA = fbPhysAddr - fbBase + bar1Offset
++ */
++static NvU64
++_kbusGetStaticBar1Offset_TU102
++(
++    KernelBus  *pKernelBus,
++    NvU32       gfid,
++    NvU64       consoleSize,
++    NvU64       mailboxSize
++)
++{
++    NvU64 rawStart          = consoleSize + mailboxSize;
++    NvU64 bar1VASizeAligned = RM_ALIGN_DOWN(pKernelBus->bar1[gfid].mappableLength,
++                                            RM_PAGE_SIZE_2M);
++    NvU64 bar1Offset        = NV_ALIGN_UP64(rawStart, RM_PAGE_SIZE_512M);
++
++    if ((bar1Offset + KBUS_STATIC_BAR1_TAIL_NEED(pKernelBus)) > bar1VASizeAligned)
++    {
++        bar1Offset = NV_ALIGN_UP64(rawStart, RM_PAGE_SIZE_2M);
++    }
++
++    return bar1Offset;
++}
++
+ /**
+  * @brief Check if the GPU supports static BAR1
+  *
+@@ -432,12 +877,36 @@ kbusIsStaticBar1Supported_TU102
+ 
+                 if (bar1VASizeAligned < bar1MapSize)
+                 {
+-                    NV_PRINTF(LEVEL_ERROR, "BAR1 size %lld is not large enough to map FB size"
+-                                           "%lld to force static BAR1\n",
+-                                            bar1VASizeAligned, bar1MapSize);
+-                    DBG_BREAKPOINT();
++                    //
++                    // BARLINK_PCIE: BAR1 is too small for the entire
++                    // client-visible FB. This used to be rejected here.
++                    // Now check whether a large enough window remains at the
++                    // lowest FB offset PMA can hand out.
++                    //
++                    NvU64 fbBase     = _kbusGetStaticBar1FbBase_TU102(pGpu, pKernelBus, NULL);
++                    NvU64 bar1Offset = _kbusGetStaticBar1Offset_TU102(pKernelBus, gfid,
++                                                                      consoleSize, mailboxSize);
++                    NvU64 windowSize = _kbusGetStaticBar1MapSize_TU102(pGpu, pKernelBus,
++                                                                       gfid, bar1Offset, fbBase);
++
++                    if (windowSize == 0)
++                    {
++                        NV_PRINTF(LEVEL_ERROR, "BAR1 size %lld is not large enough to map FB size"
++                                               "%lld to force static BAR1, and no usable window "
++                                               "remains at BAR1 offset 0x%llx / FB base 0x%llx\n",
++                                                bar1VASizeAligned, bar1MapSize, bar1Offset, fbBase);
++
++                        return NV_ERR_INVALID_REGISTRY_KEY;
++                    }
++
++                    NV_PRINTF(LEVEL_ERROR, "Static BAR1 covers only a window of 0x%llx bytes "
++                                             "at FB offset 0x%llx (client FB 0x%llx, BAR1 VA "
++                                             "0x%llx). Allocations outside the window use the "
++                                             "dynamic BAR1 region and are not reachable through "
++                                             "static BAR1 P2P.\n",
++                                             windowSize, fbBase, bar1MapSize, bar1VASizeAligned);
+ 
+-                    return NV_ERR_INVALID_REGISTRY_KEY;
++                    return NV_OK;
+                 }
+ 
+                 return NV_OK;
+@@ -536,6 +1005,8 @@ kbusEnableStaticBar1Mapping_TU102
+     NV_STATUS status = NV_OK;
+     NvU64 bar1MapSize;
+     NvU64 bar1BusAddr;
++    NvU64 fbBase;
++    NvBool bFbBaseFromRegkey = NV_FALSE;
+     NvU32 mapFlags = BUS_MAP_FB_FLAGS_MAP_UNICAST | BUS_MAP_FB_FLAGS_MAP_OFFSET_FIXED;
+ 
+     //
+@@ -551,6 +1022,61 @@ kbusEnableStaticBar1Mapping_TU102
+     bar1MapSize = RM_ALIGN_DOWN(memmgrGetClientFbAddrSpaceSize(pGpu, pMemoryManager),
+                                 RM_PAGE_SIZE_2M);
+ 
++    //
++    // BARLINK_PCIE: where the window starts in FB.
++    //
++    // Previously the window started at FB offset 0. That is measurably
++    // useless on a GPU whose BAR1 does not cover the whole FB: FB region 0 is
++    // the console / display / link training reservation, it is marked
++    // bRsvdRegion (on GSP GPUs already by the firmware region table, see
++    // memmgrInitBaseFbRegions_FWCLIENT) and _pmaInitFbRegions
++    // (gpu/mem_mgr/mem_mgr.c) explicitly skips internal and reserved regions
++    // when registering memory with PMA. What PMA never gets, cudaMalloc can
++    // never return. On an RTX 3080 no allocation out of 1024 x 1 MiB landed
++    // in the 188 MiB window at FB offset 0.
++    //
++    // The window therefore starts at the base of the first region that is
++    // neither bRsvdRegion nor bInternalHeap, read from
++    // pMemoryManager->Ram.fbRegion[] at runtime. See
++    // _kbusGetStaticBar1FbBase_TU102 for the ordering argument and
++    // NV_REG_STR_RM_STATIC_BAR1_FB_BASE_MB for the manual override.
++    //
++    // The relation used from here on everywhere is
++    //     BAR1 VA = fbPhysAddr - fbBase + startOffset
++    // valid for fbPhysAddr in [fbBase, fbBase + size). It is carried through
++    //      - _kbusUpdateStaticBar1VAMapping_TU102
++    //      - kbusGetStaticFbAperture_TU102
++    //      - NV2080_CTRL_CMD_FB_GET_STATIC_BAR1_INFO (staticBar1FbBase)
++    //      - _nvGpuOpsEncodeBar1P2PAddrs in nv_gpu_ops.c
++    //      - uvm_gpu_peer_phys_address and uvm_va_range_device_p2p.c in UVM
++    //
++    // Note on the console surface: it is no longer inside the window when
++    // fbBase is above it, so the overwrite hazard that the previous comment
++    // described is gone in the automatic case. With an explicit
++    // RMStaticBar1FbBaseMB below the first PMA region it comes back.
++    //
++    fbBase = _kbusGetStaticBar1FbBase_TU102(pGpu, pKernelBus, &bFbBaseFromRegkey);
++
++    //
++    // BARLINK_PCIE: if BAR1 is not large enough for the client-visible FB
++    // above fbBase, only a window is mapped.
++    // _kbusGetStaticBar1MapSize_TU102 then returns the smaller size.
++    //
++    {
++        NvU64 windowSize = _kbusGetStaticBar1MapSize_TU102(pGpu, pKernelBus, gfid,
++                                                           bar1Offset, fbBase);
++
++        NV_CHECK_OR_RETURN(LEVEL_ERROR, windowSize != 0, NV_ERR_NOT_SUPPORTED);
++
++        if (windowSize != bar1MapSize)
++        {
++            NV_PRINTF(LEVEL_ERROR, "BARLINK_PCIE: static BAR1 window 0x%llx of client FB 0x%llx "
++                                   "starting at FB offset 0x%llx\n",
++                                   windowSize, bar1MapSize, fbBase);
++        }
++        bar1MapSize = windowSize;
++    }
++
+     //
+     // The static mapping is not backed by an allocated physical FB.
+     // Here RM describes the memory for the static mapping.
+@@ -559,7 +1085,7 @@ kbusEnableStaticBar1Mapping_TU102
+                                          NV_MEMORY_CONTIGUOUS, ADDR_FBMEM,
+                                          NV_MEMORY_UNCACHED, MEMDESC_FLAGS_NONE));
+ 
+-    memdescDescribe(pMemDesc, ADDR_FBMEM, 0, bar1MapSize);
++    memdescDescribe(pMemDesc, ADDR_FBMEM, fbBase, bar1MapSize);
+ 
+     // Set to use RM_PAGE_SIZE_HUGE, 2MB
+     memdescSetPageSize(pMemDesc, AT_GPU, RM_PAGE_SIZE_HUGE);
+@@ -607,9 +1133,21 @@ kbusEnableStaticBar1Mapping_TU102
+     pKernelBus->bar1[gfid].staticBar1.pDmaMemDesc = pDmaMemDesc;
+     pKernelBus->bar1[gfid].staticBar1.startOffset = bar1Offset;
+     pKernelBus->bar1[gfid].staticBar1.size = bar1MapSize;
+-
+-    NV_PRINTF(LEVEL_INFO, "Static bar1 mapped offset 0x%llx size 0x%llx\n",
+-                           bar1Offset, bar1MapSize);
++    pKernelBus->bar1[gfid].staticBar1.fbBase = fbBase;
++
++    NV_PRINTF(LEVEL_ERROR,
++              "BARLINK_PCIE: static BAR1 active: FB [0x%llx, 0x%llx) size 0x%llx "
++              "(FB base source: %s) -> BAR1 offset 0x%llx, bus address 0x%llx "
++              "(BAR1 phys base 0x%llx), BAR1 VA = fbPhysAddr - 0x%llx + 0x%llx, "
++              "dynamic BAR1 left below 0x%llx above 0x%llx\n",
++              fbBase, fbBase + bar1MapSize, bar1MapSize,
++              bFbBaseFromRegkey ? "RMStaticBar1FbBaseMB" : "FB region table",
++              bar1Offset, bar1BusAddr, gpumgrGetGpuPhysFbAddr(pGpu),
++              fbBase, bar1Offset, bar1Offset,
++              (RM_ALIGN_DOWN(pKernelBus->bar1[gfid].mappableLength, RM_PAGE_SIZE_2M) >
++               (bar1Offset + bar1MapSize)) ?
++                  (RM_ALIGN_DOWN(pKernelBus->bar1[gfid].mappableLength,
++                                 RM_PAGE_SIZE_2M) - bar1Offset - bar1MapSize) : 0);
+ 
+     return NV_OK;
+ 
+@@ -625,6 +1163,7 @@ cleanup_mem:
+     pKernelBus->bar1[gfid].bStaticBar1Enabled = NV_FALSE;
+     pKernelBus->bar1[gfid].staticBar1.pVidMemDesc = NULL;
+     pKernelBus->bar1[gfid].staticBar1.pDmaMemDesc = NULL;
++    pKernelBus->bar1[gfid].staticBar1.fbBase = 0;
+ 
+     memdescDestroy(pDmaMemDesc);
+     memdescDestroy(pMemDesc);
+@@ -666,6 +1205,9 @@ kbusDisableStaticBar1Mapping_TU102
+ 
+     memdescDestroy(pKernelBus->bar1[gfid].staticBar1.pDmaMemDesc);
+     pKernelBus->bar1[gfid].staticBar1.pDmaMemDesc = NULL;
++
++    // BARLINK_PCIE: forget the FB window base together with the mapping
++    pKernelBus->bar1[gfid].staticBar1.fbBase = 0;
+ }
+ 
+ /*!
+@@ -768,6 +1310,16 @@ _kbusUpdateStaticBar1VAMapping_TU102
+     NV_ASSERT_OR_RETURN(rmDeviceGpuLockIsOwner(gpuGetInstance(pGpu)),
+                         NV_ERR_INVALID_LOCK_STATE);
+
++    //
++    // BARLINK_PCIE: the window covers FB [fbBase, fbBase + size). Outside
++    // that range "physAddr - fbBase" is not defined (and would underflow
++    // below fbBase), so refuse before touching any PTE. The caller treats
++    // NV_ERR_NOT_SUPPORTED as "use the dynamic BAR1 region".
++    //
++    NV_CHECK_OR_RETURN(LEVEL_SILENT,
++        _kbusIsInStaticBar1Window_TU102(pGpu, pKernelBus, gfid, pMemDesc, NV_TRUE),
++        NV_ERR_NOT_SUPPORTED);
++
+     if (bRelease)
+     {
+         comprInfo.kind = pKernelBus->staticBar1DefaultKind;
+@@ -784,10 +1336,17 @@ _kbusUpdateStaticBar1VAMapping_TU102
+ 
+     for (offset = 0; offset < mapSize; offset += mapGranularity)
+     {
+-        // Under static BAR1 mapping, BAR1 VA equal to fb physAddr plus startOffset
++        //
++        // Under static BAR1 mapping, BAR1 VA equals the fb physAddr shifted
++        // by the window base:
++        //     BAR1 VA = physAddr - fbBase + startOffset
++        // (BARLINK_PCIE: fbBase was 0 before the window was moved off the
++        // console region, see kbusEnableStaticBar1Mapping_TU102).
+         // dmaUpdateVASpace_HAL sets localized bit based on the pageArray->bLocalized
++        //
+         physAddr = memdescGetPhysAddr(pMemDesc, addressTranslation, offset);
+-        vaLo     = physAddr + pKernelBus->bar1[gfid].staticBar1.startOffset;
++        vaLo     = physAddr - pKernelBus->bar1[gfid].staticBar1.fbBase +
++                   pKernelBus->bar1[gfid].staticBar1.startOffset;
+         vaHi     = vaLo + mapGranularity - 1;
+ 
+         //
+@@ -867,6 +1426,7 @@ NV_STATUS kbusIncreaseStaticBar1Refcount_TU102
+     NV_STATUS           status = NV_OK;
+     NvU32               requestedKind;
+     NvU32               requestedDmaFlags;
++    NvU32               gfid;
+ 
+     NV_CHECK_OR_RETURN(LEVEL_SILENT, kbusIsStaticBar1Enabled(pGpu, pKernelBus),
+                         NV_ERR_NOT_SUPPORTED);
+@@ -874,6 +1434,21 @@ NV_STATUS kbusIncreaseStaticBar1Refcount_TU102
+     requestedKind = memdescGetPteKind(pMemDesc);
+     pRootMemDesc  = memdescGetRootMemDesc(pMemDesc, &rootOffset);
+ 
++    //
++    // BARLINK_PCIE: only take a reference for memory the static window can
++    // actually address. Without this an allocation outside the window would
++    // get a refcount here while kbusGetStaticFbAperture_TU102 and
++    // kbusDecreaseStaticBar1Refcount_TU102 correctly reject it, leaving the
++    // count unbalanced. With a non zero fbBase it would additionally let
++    // _kbusUpdateStaticBar1VAMapping_TU102 compute a negative offset.
++    //
++    NV_ASSERT_OR_RETURN(vgpuGetCallingContextGfid(pGpu, &gfid) == NV_OK,
++                        NV_ERR_INVALID_STATE);
++
++    NV_CHECK_OR_RETURN(LEVEL_SILENT,
++        _kbusIsInStaticBar1Window_TU102(pGpu, pKernelBus, gfid, pRootMemDesc, NV_FALSE),
++        NV_ERR_NOT_SUPPORTED);
++
+     requestedDmaFlags = kbusConvertBusMapFlagsToDmaFlags(pKernelBus, pMemDesc, busMapFlags);
+ 
+     //
+@@ -1069,14 +1644,31 @@ kbusGetStaticFbAperture_TU102
+     while (memoryIteratorNext(&it, &curRange))
+     {
+         NvU64 curLimit = mrangeLimit(curRange);
+-        NvU64 staticBar1Size = pKernelBus->bar1[gfid].staticBar1.size;
++        //
++        // BARLINK_PCIE: the window covers FB [fbBase, fbBase + size), not
++        // [0, size). Ranges below fbBase or above the window go to the
++        // dynamic region.
++        //
++        NvU64 fbBase      = pKernelBus->bar1[gfid].staticBar1.fbBase;
++        NvU64 staticLimit = fbBase + pKernelBus->bar1[gfid].staticBar1.size;
+ 
+         pMemArea->numRanges++;
+ 
+-        if (curLimit > staticBar1Size)
++        if (curLimit > staticLimit)
++        {
++            bInDynamicRegion = NV_TRUE;
++            bInLastPage = bInLastPage && ((curLimit - staticLimit) < RM_PAGE_SIZE_2M);
++        }
++        else if (curRange.start < fbBase)
+         {
++            //
++            // Below the window. This is the console / display / RM reserved
++            // area, it is never handed to clients but RM itself does map
++            // from there. bInLastPage does not apply, the mixed case below
++            // must be rejected outright.
++            //
+             bInDynamicRegion = NV_TRUE;
+-            bInLastPage = bInLastPage && ((curLimit - staticBar1Size) < RM_PAGE_SIZE_2M);
++            bInLastPage      = NV_FALSE;
+         }
+         else
+         {
+@@ -1101,7 +1693,10 @@ kbusGetStaticFbAperture_TU102
+ 
+         NV_PRINTF(LEVEL_ERROR, "MemDesc spans both static and dynamic region,"
+                                "which is unsupported.\n");
+-        NV_PRINTF(LEVEL_ERROR, "static Bar1 map [0, 0x%llx]\n",
++        NV_PRINTF(LEVEL_ERROR, "static Bar1 map FB [0x%llx, 0x%llx), size 0x%llx\n",
++                  pKernelBus->bar1[gfid].staticBar1.fbBase,
++                  pKernelBus->bar1[gfid].staticBar1.fbBase +
++                      pKernelBus->bar1[gfid].staticBar1.size,
+                   pKernelBus->bar1[gfid].staticBar1.size);
+         NV_PRINTF(LEVEL_ERROR, "Requested map range 0x%llx to 0x%llx, mapGranularity 0x%llx\n",
+                   mapRange.start, mrangeLimit(mapRange) - 1llu, mapRange.size);
+@@ -1119,7 +1714,8 @@ kbusGetStaticFbAperture_TU102
+ 
+     //
+     // When the static bar1 is enabled, the Fb aperture offset is the
+-    // physical address.
++    // physical address shifted by the window base
++    // (BARLINK_PCIE: startOffset - fbBase, see below).
+     //
+     if (!bUnmanagedRange)
+     {
+@@ -1152,7 +1748,13 @@ kbusGetStaticFbAperture_TU102
+     while (memoryIteratorNext(&it, &curRange))
+     {
+         pMemArea->pRanges[pMemArea->numRanges] = curRange;
+-        pMemArea->pRanges[pMemArea->numRanges].start += pKernelBus->bar1[gfid].staticBar1.startOffset;
++        //
++        // BARLINK_PCIE: BAR1 offset = fbPhysAddr - fbBase + startOffset.
++        // The loop above guarantees curRange.start >= fbBase.
++        //
++        pMemArea->pRanges[pMemArea->numRanges].start +=
++            pKernelBus->bar1[gfid].staticBar1.startOffset -
++            pKernelBus->bar1[gfid].staticBar1.fbBase;
+         pMemArea->numRanges++;
+     }
+ 
+diff --git a/src/nvidia/src/kernel/gpu/bus/kern_bus.c b/src/nvidia/src/kernel/gpu/bus/kern_bus.c
+index 3eb21ff..558e4c1 100644
+--- a/src/nvidia/src/kernel/gpu/bus/kern_bus.c
++++ b/src/nvidia/src/kernel/gpu/bus/kern_bus.c
+@@ -197,6 +197,56 @@ kbusInitRegistryOverrides(OBJGPU *pGpu, KernelBus *pKernelBus)
+         pKernelBus->staticBar1ForceType = NV_REG_STR_RM_FORCE_STATIC_BAR1_AUTO;
+     }
+ 
++    //
++    // BARLINK_PCIE: kernel RM only override of the force type.
++    //
++    // NV_REG_STR_RM_FORCE_STATIC_BAR1 is packaged by RmPackageRegistry() and
++    // sent to the GSP firmware, which applies its own unpatched static BAR1
++    // checks and fails GSP-RM init when BAR1 is smaller than the FB. This key
++    // is unknown to GSP-RM and therefore only affects kernel RM.
++    //
++    if ((osReadRegistryDword(pGpu, NV_REG_STR_RM_STATIC_BAR1_LOCAL_FORCE, &data32) == NV_OK) &&
++        (data32 < NV_REG_STR_RM_FORCE_STATIC_BAR1_MAX))
++    {
++        pKernelBus->staticBar1ForceType = data32;
++    }
++
++    //
++    // BARLINK_PCIE: window size, FB base and dynamic reserve overrides. All
++    // in MiB, 0 keeps the built in behaviour.
++    //
++    pKernelBus->staticBar1WindowMB = NV_REG_STR_RM_STATIC_BAR1_WINDOW_MB_DEFAULT;
++    if (osReadRegistryDword(pGpu, NV_REG_STR_RM_STATIC_BAR1_WINDOW_MB, &data32) == NV_OK)
++    {
++        pKernelBus->staticBar1WindowMB = data32;
++    }
++
++    pKernelBus->staticBar1ReserveMB = NV_REG_STR_RM_STATIC_BAR1_RESERVE_MB_DEFAULT;
++    if (osReadRegistryDword(pGpu, NV_REG_STR_RM_STATIC_BAR1_RESERVE_MB, &data32) == NV_OK)
++    {
++        pKernelBus->staticBar1ReserveMB = data32;
++    }
++
++    pKernelBus->staticBar1FbBaseMB = NV_REG_STR_RM_STATIC_BAR1_FB_BASE_MB_DEFAULT;
++    if (osReadRegistryDword(pGpu, NV_REG_STR_RM_STATIC_BAR1_FB_BASE_MB, &data32) == NV_OK)
++    {
++        pKernelBus->staticBar1FbBaseMB = data32;
++    }
++
++    //
++    // Printed at LEVEL_ERROR on purpose so that the effective configuration
++    // shows up in dmesg without raising the debug level.
++    //
++    NV_PRINTF(LEVEL_ERROR,
++              "BARLINK_PCIE: staticBar1ForceType %u, RMStaticBar1WindowMB %u (0 = auto), "
++              "RMStaticBar1ReserveMB %u (0 = default %u MB), "
++              "RMStaticBar1FbBaseMB %u (0 = auto from FB region table)\n",
++              pKernelBus->staticBar1ForceType,
++              pKernelBus->staticBar1WindowMB,
++              pKernelBus->staticBar1ReserveMB,
++              (NvU32)(KBUS_STATIC_BAR1_DYNAMIC_RESERVE >> 20),
++              pKernelBus->staticBar1FbBaseMB);
++
+     //
+     // NV_REG_STR_RM_GPUDIRECT_RDMA_FORCE_SPA regkey
+     // is only used on coherent systems with BAR1 enabled.
+diff --git a/src/nvidia/src/kernel/gpu/mem_sys/kern_mem_sys_ctrl.c b/src/nvidia/src/kernel/gpu/mem_sys/kern_mem_sys_ctrl.c
+index 677238e..3e35945 100644
+--- a/src/nvidia/src/kernel/gpu/mem_sys/kern_mem_sys_ctrl.c
++++ b/src/nvidia/src/kernel/gpu/mem_sys/kern_mem_sys_ctrl.c
+@@ -1315,11 +1315,21 @@ subdeviceCtrlCmdFbGetStaticBar1Info_IMPL
+     {
+         pParams->staticBar1StartOffset = pKernelBus->bar1[gfid].staticBar1.startOffset;
+         pParams->staticBar1Size        = pKernelBus->bar1[gfid].staticBar1.size;
++        // BARLINK_PCIE: FB offset the window starts at, 0 if it starts at FB 0
++        pParams->staticBar1FbBase      = pKernelBus->bar1[gfid].staticBar1.fbBase;
++
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: FB_GET_STATIC_BAR1_INFO -> BAR1 offset 0x%llx, "
++                  "size 0x%llx, FB base 0x%llx (FB [0x%llx, 0x%llx))\n",
++                  pParams->staticBar1StartOffset, pParams->staticBar1Size,
++                  pParams->staticBar1FbBase, pParams->staticBar1FbBase,
++                  pParams->staticBar1FbBase + pParams->staticBar1Size);
+     }
+     else
+     {
+         pParams->staticBar1StartOffset = 0;
+         pParams->staticBar1Size = 0;
++        pParams->staticBar1FbBase = 0;
+     }
+ 
+     return status;
+diff --git a/src/nvidia/src/kernel/gpu/gpu.c b/src/nvidia/src/kernel/gpu/gpu.c
+--- a/src/nvidia/src/kernel/gpu/gpu.c
++++ b/src/nvidia/src/kernel/gpu/gpu.c
+@@ -2530,6 +2530,20 @@ _gpuInitPcieP2PCapability
+                              sizeof(NV2080_CTRL_INTERNAL_GET_PCIE_P2P_CAPS_PARAMS));
+     NV_ASSERT_OR_RETURN_VOID(status == NV_OK);
+
++    //
++    // BARLINK_PCIE: port note (615 relocated the per-GPU GSP caps query from
++    // platform/p2p/p2p_caps.c into this init helper, so the diagnostic that
++    // flags the GSP-RM answer follows it here). This is the GSP-RM answer
++    // (ROUTE_TO_PHYSICAL): GSP-RM does not know about the kernel-side static
++    // BAR1 configuration, so a "not supported" here says nothing about the
++    // BAR1 path.
++    //
++    NV_PRINTF(LEVEL_ERROR,
++              "BARLINK_PCIE: capsSource=GSP_MAILBOX " BARLINK_PCIE_GPU_FMT
++              " -> read=0x%x write=0x%x\n",
++              BARLINK_PCIE_GPU_ARG(pGpu),
++              p2pCapsParams.p2pReadCapsStatus, p2pCapsParams.p2pWriteCapsStatus);
++
+     pGpu->pcieP2PReadCaps = p2pCapsParams.p2pReadCapsStatus;
+     pGpu->pcieP2PWriteCaps = p2pCapsParams.p2pWriteCapsStatus;
+     pGpu->bPcieP2PSkipChipsetCheck = p2pCapsParams.bSkipChipsetCheck;
+diff --git a/src/nvidia/src/kernel/platform/p2p/p2p_caps.c b/src/nvidia/src/kernel/platform/p2p/p2p_caps.c
+index c7f1c2c..5c2603b 100644
+--- a/src/nvidia/src/kernel/platform/p2p/p2p_caps.c
++++ b/src/nvidia/src/kernel/platform/p2p/p2p_caps.c
+@@ -26,6 +26,7 @@
+ #include "kernel/gpu/mig_mgr/kernel_mig_manager.h"
+ #include "kernel/gpu/nvlink/kernel_nvlink.h"
+ #include "kernel/gpu/bif/kernel_bif.h"
++#include "gpu/bus/kern_bus.h"   // BARLINK_PCIE: BARLINK_PCIE_GPU_FMT / _ARG
+ #include "gpu/subdevice/subdevice.h"
+ #include "gpu/gpu.h"
+ #include "virtualization/hypervisor/hypervisor.h"
+@@ -66,6 +67,174 @@ areGpusP2PCompatible(OBJGPU *pGpu0, OBJGPU *pGpu1)
+     return NV_TRUE;
+ }
+ 
++/**
++ * BARLINK_PCIE: decode NV0000_P2P_CAPS_STATUS_* for the log lines.
++ *
++ * IMPORTANT: NV0000_P2P_CAPS_STATUS_OK is 0x00. A verdict line reading
++ * "read=0x0 write=0x0" therefore means read and write are GRANTED, it does
++ * not mean the caps are empty. See ctrl0000system.h.
++ */
++static const char *
++_smallbarP2pCapsStatusStr
++(
++    NvU8 status
++)
++{
++    switch (status)
++    {
++        case NV0000_P2P_CAPS_STATUS_OK:                         return "OK";
++        case NV0000_P2P_CAPS_STATUS_CHIPSET_NOT_SUPPORTED:      return "CHIPSET_NOT_SUPPORTED";
++        case NV0000_P2P_CAPS_STATUS_GPU_NOT_SUPPORTED:          return "GPU_NOT_SUPPORTED";
++        case NV0000_P2P_CAPS_STATUS_IOH_TOPOLOGY_NOT_SUPPORTED: return "IOH_TOPOLOGY_NOT_SUPPORTED";
++        case NV0000_P2P_CAPS_STATUS_DISABLED_BY_REGKEY:         return "DISABLED_BY_REGKEY";
++        case NV0000_P2P_CAPS_STATUS_NOT_SUPPORTED:              return "NOT_SUPPORTED";
++        default:                                                return "???";
++    }
++}
++
++/**
++ * BARLINK_PCIE: decode P2P_CONNECTIVITY (platform/p2p/p2p_caps.h).
++ *
++ * The numeric values are UNKNOWN=0, PCIE_PROPRIETARY=1 (mailbox),
++ * PCIE_BAR1=2, NVLINK=3, NVLINK_INDIRECT=4, C2C=5.
++ */
++static const char *
++_smallbarP2pConnectivityStr
++(
++    P2P_CONNECTIVITY connectivity
++)
++{
++    switch (connectivity)
++    {
++        case P2P_CONNECTIVITY_UNKNOWN:          return "UNKNOWN";
++        case P2P_CONNECTIVITY_PCIE_PROPRIETARY: return "PCIE_PROPRIETARY(mailbox)";
++        case P2P_CONNECTIVITY_PCIE_BAR1:        return "PCIE_BAR1";
++        case P2P_CONNECTIVITY_NVLINK:           return "NVLINK";
++        case P2P_CONNECTIVITY_NVLINK_INDIRECT:  return "NVLINK_INDIRECT";
++        case P2P_CONNECTIVITY_C2C:              return "C2C";
++        default:                                return "???";
++    }
++}
++
++/**
++ * BARLINK_PCIE: is the ForceP2P (NV_REG_STR_CL_FORCE_P2P) override armed for
++ * any GPU in the mask? Used only to attribute the origin of the returned caps
++ * in the log, it has no influence on the decision itself.
++ */
++static NvBool
++_smallbarP2pIsForceP2POverrideArmed
++(
++    NvU32  gpuMask,
++    NvU32 *pOverrideValue
++)
++{
++    OBJGPU *pGpu        = NULL;
++    NvU32   gpuInstance = 0;
++
++    while ((pGpu = gpumgrGetNextGpu(gpuMask, &gpuInstance)) != NULL)
++    {
++        KernelBif *pKernelBif = GPU_GET_KERNEL_BIF(pGpu);
++
++        if ((pKernelBif != NULL) &&
++            (pKernelBif->p2pOverride != BIF_P2P_NOT_OVERRIDEN))
++        {
++            if (pOverrideValue != NULL)
++            {
++                *pOverrideValue = pKernelBif->p2pOverride;
++            }
++            return NV_TRUE;
++        }
++    }
++
++    return NV_FALSE;
++}
++
++/**
++ * BARLINK_PCIE: is static BAR1 actually active on EVERY GPU of the mask?
++ *
++ * This is the gate for the decoupled BAR1 evaluation in p2pGetCapsStatus.
++ * kbusIsStaticBar1Enabled() reflects the state after kbusEnableStaticBar1Mapping
++ * really succeeded, no matter whether static BAR1 got there through the regular
++ * path (RMForceStaticBar1 / PDB default) or through our kernel-only
++ * RMStaticBar1LocalForce. If static BAR1 is off anywhere in the mask this
++ * returns NV_FALSE and the old, untouched code path is taken.
++ */
++static NvBool
++_smallbarP2pIsStaticBar1ActiveForMask
++(
++    NvU32 gpuMask
++)
++{
++    OBJGPU *pGpu        = NULL;
++    NvU32   gpuInstance = 0;
++    NvU32   gpuCount    = 0;
++
++    while ((pGpu = gpumgrGetNextGpu(gpuMask, &gpuInstance)) != NULL)
++    {
++        KernelBus *pKernelBus = GPU_GET_KERNEL_BUS(pGpu);
++
++        if ((pKernelBus == NULL) ||
++            !kbusIsStaticBar1Enabled(pGpu, pKernelBus))
++        {
++            return NV_FALSE;
++        }
++
++        gpuCount++;
++    }
++
++    return (gpuCount > 0);
++}
++
++/**
++ * BARLINK_PCIE: log the final peer verdict for every GPU pair in the mask.
++ *
++ * Every line carries RM instance and PCI address of both participants,
++ * otherwise the lines cannot be attributed in a rig with three GPUs.
++ */
++static void
++_barlinkPcieLogVerdict
++(
++    NvU32             gpuMask,
++    const char       *pStage,
++    P2P_CONNECTIVITY  connectivity,
++    NvU8              readStatus,
++    NvU8              writeStatus,
++    NvU8              atomicsStatus,
++    const char       *pReason
++)
++{
++    NvU32   gpuInstance = 0;
++    OBJGPU *pFirstGpu   = gpumgrGetNextGpu(gpuMask, &gpuInstance);
++    OBJGPU *pPeerGpu;
++
++    if (pFirstGpu == NULL)
++    {
++        return;
++    }
++
++    // Single GPU in the mask means a loopback query
++    if (gpumgrGetSubDeviceCount(gpuMask) <= 1)
++    {
++        gpuInstance = 0;
++    }
++
++    while ((pPeerGpu = gpumgrGetNextGpu(gpuMask, &gpuInstance)) != NULL)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: p2pCapsVerdict[%s] " BARLINK_PCIE_GPU_FMT " <-> "
++                  BARLINK_PCIE_GPU_FMT " gpuMask=0x%x : connectivity=%u(%s) "
++                  "read=0x%x(%s) write=0x%x(%s) atomics=0x%x(%s) -- %s\n",
++                  pStage,
++                  BARLINK_PCIE_GPU_ARG(pFirstGpu), BARLINK_PCIE_GPU_ARG(pPeerGpu),
++                  gpuMask, (NvU32)connectivity,
++                  _smallbarP2pConnectivityStr(connectivity),
++                  readStatus,    _smallbarP2pCapsStatusStr(readStatus),
++                  writeStatus,   _smallbarP2pCapsStatusStr(writeStatus),
++                  atomicsStatus, _smallbarP2pCapsStatusStr(atomicsStatus),
++                  pReason);
++    }
++}
++
+ NV_STATUS
+ p2pGetCaps
+ (
+@@ -106,9 +275,17 @@ p2pGetCaps
+           (connectivity == P2P_CONNECTIVITY_NVLINK) ||
+           (connectivity == P2P_CONNECTIVITY_C2C)))
+     {
++        _barlinkPcieLogVerdict(gpuMask, "p2pGetCaps", connectivity,
++                               p2PReadCapsStatus, p2PWriteCapsStatus,
++                               p2PAtomicsCapsStatus,
++                               "no direct connectivity, returning NV_ERR_NOT_SUPPORTED");
+         return NV_ERR_NOT_SUPPORTED;
+     }
+ 
++    _barlinkPcieLogVerdict(gpuMask, "p2pGetCaps", connectivity,
++                           p2PReadCapsStatus, p2PWriteCapsStatus,
++                           p2PAtomicsCapsStatus, "direct connectivity accepted");
++
+     *pP2PWriteCapable = (p2PWriteCapsStatus == NV0000_P2P_CAPS_STATUS_OK);
+     *pP2PReadCapable = (p2PReadCapsStatus == NV0000_P2P_CAPS_STATUS_OK);
+     *pP2PAtomicsCapable = (p2PAtomicsCapsStatus == NV0000_P2P_CAPS_STATUS_OK);
+@@ -321,7 +498,8 @@ _kp2pCapsCheckStatusOverridesForPcie
+     NvU32 gpuMask,
+     NvU8 *pP2PWriteCapStatus,
+     NvU8 *pP2PReadCapStatus,
+-    NvU8 *pP2PAtomicsCapStatus
++    NvU8 *pP2PAtomicsCapStatus,
++    const char *pCaller        // BARLINK_PCIE: only used for the log line
+ )
+ {
+     KernelBif *pKernelBif  = NULL;
+@@ -370,6 +548,25 @@ _kp2pCapsCheckStatusOverridesForPcie
+                     break;
+             }
+ 
++            //
++            // BARLINK_PCIE: whenever this fires the returned caps come from the
++            // ForceP2P regkey, NOT from any topology or BAR1 evaluation. Both
++            // _kp2pCapsGetStatusOverPcie and _kp2pCapsGetStatusOverPcieBar1
++            // return straight after this, so nothing below is ever consulted.
++            //
++            NV_PRINTF(LEVEL_ERROR,
++                      "BARLINK_PCIE: capsSource=FORCE_P2P_REGKEY caller=%s "
++                      BARLINK_PCIE_GPU_FMT " gpuMask=0x%x : ForceP2P=0x%x -> "
++                      "read=0x%x(%s) write=0x%x(%s) atomics=0x%x(%s)\n",
++                      pCaller, BARLINK_PCIE_GPU_ARG(pGpu), gpuMask,
++                      pKernelBif->p2pOverride,
++                      *pP2PReadCapStatus,
++                      _smallbarP2pCapsStatusStr(*pP2PReadCapStatus),
++                      *pP2PWriteCapStatus,
++                      _smallbarP2pCapsStatusStr(*pP2PWriteCapStatus),
++                      *pP2PAtomicsCapStatus,
++                      _smallbarP2pCapsStatusStr(*pP2PAtomicsCapStatus));
++
+             return NV_TRUE;
+         }
+ 
+@@ -414,11 +611,13 @@ _kp2pCapsGetStatusOverPcie
+     NvU32 lockedGpuMask = 0;
+     NV_STATUS status = NV_OK;
+     OBJHYPERVISOR *pHypervisor = SYS_GET_HYPERVISOR(pSys);
+-    NvU8 unused; // atomics are never supported for mailbox PCIe.
++    // atomics are never supported for mailbox PCIe.
++    NvU8 unused = NV0000_P2P_CAPS_STATUS_NOT_SUPPORTED;
+ 
+     // Check if any overrides are enabled.
+     if (_kp2pCapsCheckStatusOverridesForPcie(gpuMask, pP2PWriteCapStatus,
+-                                            pP2PReadCapStatus, &unused))
++                                            pP2PReadCapStatus, &unused,
++                                            "mailbox"))
+     {
+         return NV_OK;
+     }
+@@ -664,6 +877,24 @@ _p2pCapsGetHostSystemStatusOverPcieBar1
+         NV_PRINTF(LEVEL_INFO, "Unrecognized CPU. Read Cap is disabled\n");
+     }
+ 
++    //
++    // BARLINK_PCIE: report only, the condition above is left untouched.
++    // NV0000_CTRL_SYSTEM_CPU_TYPE_RYZEN is 0x38, XEON_SPR is checked as well.
++    // cpuidInfoAMD() (platform/cpu.c:1417-1442) maps every AMD CPUID extended
++    // family 0x080/0x0A0/0x0B0 -- and its default case, i.e. anything newer --
++    // to RYZEN, so a Zen host satisfies this even without a common PCIe switch.
++    //
++    NV_PRINTF(LEVEL_ERROR,
++              "BARLINK_PCIE: bar1HostSystem " BARLINK_PCIE_GPU_FMT
++              " : commonPciSwitch=%u cpuInfo.type=0x%x (RYZEN=0x%x XEON_SPR=0x%x) "
++              "-> read=0x%x(%s) write=0x%x(%s)\n",
++              BARLINK_PCIE_GPU_ARG(pGpu), bCommonPciSwitchFound,
++              pSys->cpuInfo.type,
++              NV0000_CTRL_SYSTEM_CPU_TYPE_RYZEN,
++              NV0000_CTRL_SYSTEM_CPU_TYPE_XEON_SPR,
++              *pP2PReadCapStatus, _smallbarP2pCapsStatusStr(*pP2PReadCapStatus),
++              *pP2PWriteCapStatus, _smallbarP2pCapsStatusStr(*pP2PWriteCapStatus));
++
+     return NV_OK;
+ }
+ 
+@@ -723,6 +954,13 @@ _kp2pCapsGetStatusOverPcieBar1
+         ((pKernelBif->pcieP2PType != NV_REG_STR_RM_PCIEP2P_TYPE_BAR1) &&
+          (pKernelBif->pcieP2PType != NV_REG_STR_RM_PCIEP2P_TYPE_AUTO)))
+     {
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: bar1CapsGate " BARLINK_PCIE_GPU_FMT
++                  " gpuMask=0x%x : NO, reason=REGKEY "
++                  "(RMForceP2PType=%u, RMPcieP2PType=%u; need pcieP2PType in {BAR1=%u,AUTO=%u})\n",
++                  BARLINK_PCIE_GPU_ARG(pFirstGpu), gpuMask,
++                  pKernelBif->forceP2PType, pKernelBif->pcieP2PType,
++                  NV_REG_STR_RM_PCIEP2P_TYPE_BAR1, NV_REG_STR_RM_PCIEP2P_TYPE_AUTO);
+         return NV_ERR_NOT_SUPPORTED;
+     }
+ 
+@@ -737,14 +975,26 @@ _kp2pCapsGetStatusOverPcieBar1
+         if (!kbusIsPcieBar1P2PMappingSupported_HAL(pFirstGpu, GPU_GET_KERNEL_BUS(pFirstGpu),
+                                                    pGpuPeer, GPU_GET_KERNEL_BUS(pGpuPeer)))
+         {
++            NV_PRINTF(LEVEL_ERROR,
++                      "BARLINK_PCIE: bar1CapsGate " BARLINK_PCIE_GPU_FMT " -> "
++                      BARLINK_PCIE_GPU_FMT " : NO, reason=MAPPING_NOT_SUPPORTED "
++                      "(see preceding BARLINK_PCIE: bar1P2PSupported line)\n",
++                      BARLINK_PCIE_GPU_ARG(pFirstGpu), BARLINK_PCIE_GPU_ARG(pGpuPeer));
+             return NV_ERR_NOT_SUPPORTED;
+         }
++
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: bar1CapsGate " BARLINK_PCIE_GPU_FMT " -> "
++                  BARLINK_PCIE_GPU_FMT " : mapping supported, continuing with "
++                  "host system / chipset check\n",
++                  BARLINK_PCIE_GPU_ARG(pFirstGpu), BARLINK_PCIE_GPU_ARG(pGpuPeer));
+     }
+ 
+     // Check if any overrides are enabled.
+     if (_kp2pCapsCheckStatusOverridesForPcie(gpuMask, pP2PWriteCapStatus,
+                                              pP2PReadCapStatus,
+-                                             pP2PAtomicsCapStatus))
++                                             pP2PAtomicsCapStatus,
++                                             "bar1"))
+     {
+         return NV_OK;
+     }
+@@ -761,6 +1011,12 @@ _kp2pCapsGetStatusOverPcieBar1
+     if ((*pP2PReadCapStatus != NV0000_P2P_CAPS_STATUS_OK) ||
+         (*pP2PWriteCapStatus != NV0000_P2P_CAPS_STATUS_OK))
+     {
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: bar1CapsGate " BARLINK_PCIE_GPU_FMT
++                  " gpuMask=0x%x : NO, reason=HOST_SYSTEM "
++                  "(readCapStatus=0x%x writeCapStatus=0x%x, commonPciSwitch=%u)\n",
++                  BARLINK_PCIE_GPU_ARG(pFirstGpu), gpuMask,
++                  *pP2PReadCapStatus, *pP2PWriteCapStatus, bCommonPciSwitchFound);
+         // return not supported if it does not support both operations
+         return NV_ERR_NOT_SUPPORTED;
+     }
+@@ -776,14 +1032,22 @@ _kp2pCapsGetStatusOverPcieBar1
+     return NV_OK;
+ }
+ 
+-NV_STATUS
+-p2pGetCapsStatus
++//
++// BARLINK_PCIE: the real body of p2pGetCapsStatus. It has a return statement
++// per connectivity type, which made it impossible to log the caps at the one
++// point where they are final. p2pGetCapsStatus() below is now a thin wrapper
++// that calls this and logs exactly once, on the values that go back to the
++// caller. pCapsSource carries how those values were produced.
++//
++static NV_STATUS
++_p2pGetCapsStatusInternal
+ (
+     NvU32 gpuMask,
+     NvU8 *pP2PWriteCapStatus,
+     NvU8 *pP2PReadCapStatus,
+     NvU8 *pP2PAtomicsCapStatus,
+-    P2P_CONNECTIVITY *pConnectivity
++    P2P_CONNECTIVITY *pConnectivity,
++    const char **ppCapsSource
+ )
+ {
+     OBJSYS       *pSys          = SYS_GET_INSTANCE();
+@@ -819,6 +1083,7 @@ p2pGetCapsStatus
+             NV_PRINTF(LEVEL_NOTICE,
+                   "P2P is marked unsupported with MIG for GPU instance = 0x%x\n",
+                   gpuInstance);
++            *ppCapsSource = "MIG";
+             return NV_OK;
+         }
+     }
+@@ -835,6 +1100,7 @@ p2pGetCapsStatus
+             *pConnectivity = P2P_CONNECTIVITY_C2C;
+             // todo: move this, and other instances to cap check functions.
+             *pP2PAtomicsCapStatus = NV0000_P2P_CAPS_STATUS_OK;
++            *ppCapsSource = "C2C";
+             return NV_OK;
+         }
+     }
+@@ -848,6 +1114,7 @@ p2pGetCapsStatus
+         {
+             *pConnectivity = P2P_CONNECTIVITY_NVLINK;
+             *pP2PAtomicsCapStatus = NV0000_P2P_CAPS_STATUS_OK;
++            *ppCapsSource = "NVLINK";
+             return NV_OK;
+         }
+     }
+@@ -873,6 +1140,7 @@ p2pGetCapsStatus
+             *pP2PReadCapStatus = NV0000_P2P_CAPS_STATUS_NOT_SUPPORTED;
+             *pP2PWriteCapStatus = NV0000_P2P_CAPS_STATUS_NOT_SUPPORTED;
+             *pP2PAtomicsCapStatus = NV0000_P2P_CAPS_STATUS_NOT_SUPPORTED;
++            *ppCapsSource = "NVSWITCH_ENFORCED";
+             return NV_OK;
+         }
+     }
+@@ -886,6 +1154,7 @@ p2pGetCapsStatus
+         {
+             *pConnectivity = P2P_CONNECTIVITY_NVLINK_INDIRECT;
+             *pP2PAtomicsCapStatus = NV0000_P2P_CAPS_STATUS_OK;
++            *ppCapsSource = "NVLINK_INDIRECT";
+             return NV_OK;
+         }
+     }
+@@ -897,34 +1166,186 @@ p2pGetCapsStatus
+     // if either read or write is supported, return success. See
+     // _kp2pCapsCheckStatusOverridesForPcie for details.
+     //
+-    if (_kp2pCapsGetStatusOverPcie(gpuMask, pP2PWriteCapStatus,
+-                                  pP2PReadCapStatus, &bCommonSwitchFound) == NV_OK)
+     {
+-        if ((*pP2PWriteCapStatus == NV0000_P2P_CAPS_STATUS_OK) ||
+-            (*pP2PReadCapStatus == NV0000_P2P_CAPS_STATUS_OK))
++        NV_STATUS mailboxStatus;
++        NvBool    bMailboxUsable;
++        NvBool    bStaticBar1Active;
++
++        mailboxStatus = _kp2pCapsGetStatusOverPcie(gpuMask, pP2PWriteCapStatus,
++                                                   pP2PReadCapStatus,
++                                                   &bCommonSwitchFound);
++
++        bMailboxUsable = ((mailboxStatus == NV_OK) &&
++                          ((*pP2PWriteCapStatus == NV0000_P2P_CAPS_STATUS_OK) ||
++                           (*pP2PReadCapStatus == NV0000_P2P_CAPS_STATUS_OK)));
++
++        //
++        // BARLINK_PCIE: gate for the decoupled BAR1 evaluation.
++        //
++        // Upstream nests the BAR1 check inside the "mailbox said yes" branch
++        // above, and additionally feeds the mailbox statuses into it as in/out
++        // values, where they mask the BAR1 result (see the two
++        // "if (*pP2PxCapStatus == ..._OK)" lines in
++        // _kp2pCapsGetStatusOverPcieBar1). The mailbox caps come from GSP-RM
++        // via NV2080_CTRL_CMD_INTERNAL_GET_PCIE_P2P_CAPS (ROUTE_TO_PHYSICAL),
++        // and GSP-RM knows nothing about the kernel-side static BAR1 setup, so
++        // a GSP "no" hid an otherwise usable BAR1 path. Working around that
++        // with ForceP2P is not acceptable here: ForceP2P also unblocks the
++        // mailbox path, which corrupts data on this topology.
++        //
++        // The decoupling is therefore gated on static BAR1 being ACTIVE on
++        // every GPU of the mask. With static BAR1 off,
++        // _smallbarP2pIsStaticBar1ActiveForMask() returns NV_FALSE and the
++        // code below is byte-for-byte the upstream sequence: BAR1 is only
++        // evaluated when the mailbox said yes, and it is seeded with the
++        // mailbox statuses exactly as before.
++        //
++        bStaticBar1Active = _smallbarP2pIsStaticBar1ActiveForMask(gpuMask);
++
++        if (bMailboxUsable)
+         {
+-            NvU8 bar1P2PWriteCapStatus = *pP2PWriteCapStatus;
+-            NvU8 bar1P2PReadCapStatus = *pP2PReadCapStatus;
++            *pConnectivity = P2P_CONNECTIVITY_PCIE_PROPRIETARY;
++            *ppCapsSource  = "PCIE_MAILBOX";
++        }
++
++        if (bMailboxUsable || bStaticBar1Active)
++        {
++            NvU8 bar1P2PWriteCapStatus;
++            NvU8 bar1P2PReadCapStatus;
+             NvU8 bar1P2PAtomicsCapStatus = NV0000_P2P_CAPS_STATUS_NOT_SUPPORTED;
++            NV_STATUS bar1Status;
+ 
+-            *pConnectivity = P2P_CONNECTIVITY_PCIE_PROPRIETARY;
++            if (bStaticBar1Active)
++            {
++                //
++                // Seed neutral so that read/write reflect the BAR1 capability
++                // (host system / chipset check plus the BAR1 mapping check)
++                // and not the mailbox/GSP verdict.
++                //
++                bar1P2PWriteCapStatus = NV0000_P2P_CAPS_STATUS_OK;
++                bar1P2PReadCapStatus  = NV0000_P2P_CAPS_STATUS_OK;
++            }
++            else
++            {
++                // Upstream behaviour, unchanged.
++                bar1P2PWriteCapStatus = *pP2PWriteCapStatus;
++                bar1P2PReadCapStatus  = *pP2PReadCapStatus;
++            }
+ 
+-            if (_kp2pCapsGetStatusOverPcieBar1(gpuMask, &bar1P2PWriteCapStatus,
+-                    &bar1P2PReadCapStatus, &bar1P2PAtomicsCapStatus, bCommonSwitchFound) == NV_OK)
++            NV_PRINTF(LEVEL_ERROR,
++                      "BARLINK_PCIE: bar1Decouple gpuMask=0x%x : staticBar1Active=%u "
++                      "mailboxUsable=%u (mailboxStatus=0x%x read=0x%x(%s) write=0x%x(%s)) "
++                      "-> evaluating BAR1 with seed read=0x%x write=0x%x\n",
++                      gpuMask, bStaticBar1Active, bMailboxUsable, mailboxStatus,
++                      *pP2PReadCapStatus,
++                      _smallbarP2pCapsStatusStr(*pP2PReadCapStatus),
++                      *pP2PWriteCapStatus,
++                      _smallbarP2pCapsStatusStr(*pP2PWriteCapStatus),
++                      bar1P2PReadCapStatus, bar1P2PWriteCapStatus);
++
++            bar1Status = _kp2pCapsGetStatusOverPcieBar1(gpuMask, &bar1P2PWriteCapStatus,
++                    &bar1P2PReadCapStatus, &bar1P2PAtomicsCapStatus, bCommonSwitchFound);
++
++            if (bar1Status == NV_OK)
+             {
+                 *pP2PWriteCapStatus = bar1P2PWriteCapStatus;
+                 *pP2PReadCapStatus = bar1P2PReadCapStatus;
+                 *pP2PAtomicsCapStatus = bar1P2PAtomicsCapStatus;
+                 *pConnectivity = P2P_CONNECTIVITY_PCIE_BAR1;
++                *ppCapsSource  = bStaticBar1Active ?
++                                     (bMailboxUsable ? "PCIE_BAR1(decoupled,mailbox-also-ok)"
++                                                     : "PCIE_BAR1(decoupled,mailbox-no)") :
++                                     "PCIE_BAR1(mailbox-gated)";
+             }
++        }
++
++        if (*pConnectivity != P2P_CONNECTIVITY_UNKNOWN)
++        {
++            //
++            // BARLINK_PCIE: verdict of the PCIe branch. See P2P_CONNECTIVITY in
++            // platform/p2p/p2p_caps.h: 0 UNKNOWN, 1 PCIE_PROPRIETARY (mailbox),
++            // 2 PCIE_BAR1, 3 NVLINK, 4 NVLINK_INDIRECT, 5 C2C.
++            //
++            _barlinkPcieLogVerdict(gpuMask, "PCIE",
++                                   *pConnectivity, *pP2PReadCapStatus,
++                                   *pP2PWriteCapStatus, *pP2PAtomicsCapStatus,
++                                   (*pConnectivity == P2P_CONNECTIVITY_PCIE_BAR1) ?
++                                       "BAR1 path taken" :
++                                       "mailbox path, BAR1 rejected (see BARLINK_PCIE: bar1CapsGate)");
+ 
+             return NV_OK;
+         }
+     }
+ 
++    //
++    // BARLINK_PCIE: neither the mailbox nor the BAR1 path carried.
++    //
++    _barlinkPcieLogVerdict(gpuMask, "NONE", *pConnectivity, *pP2PReadCapStatus,
++                           *pP2PWriteCapStatus, *pP2PAtomicsCapStatus,
++                           "PCIe mailbox caps not OK and BAR1 not usable either");
++
+     return NV_OK;
+ }
+ 
++/**
++ * BARLINK_PCIE: wrapper around _p2pGetCapsStatusInternal.
++ *
++ * This is the one place where the caps are final and go back to the caller,
++ * so this is where they are logged, together with the path they took:
++ *
++ *   capsSource=FORCE_P2P_REGKEY   ForceP2P override, no evaluation happened
++ *   capsSource=PCIE_MAILBOX       GSP-RM answer for the mailbox path
++ *   capsSource=PCIE_BAR1(...)     BAR1 branch, decoupled or mailbox-gated
++ *   capsSource=NVLINK/C2C/...     the respective non-PCIe path
++ *
++ * The individual origins additionally print their own "capsSource=" line.
++ */
++NV_STATUS
++p2pGetCapsStatus
++(
++    NvU32 gpuMask,
++    NvU8 *pP2PWriteCapStatus,
++    NvU8 *pP2PReadCapStatus,
++    NvU8 *pP2PAtomicsCapStatus,
++    P2P_CONNECTIVITY *pConnectivity
++)
++{
++    NV_STATUS   status;
++    const char *pCapsSource = "NONE";
++    NvU32       forceP2POverride = BIF_P2P_NOT_OVERRIDEN;
++
++    status = _p2pGetCapsStatusInternal(gpuMask, pP2PWriteCapStatus,
++                                       pP2PReadCapStatus, pP2PAtomicsCapStatus,
++                                       pConnectivity, &pCapsSource);
++
++    if ((status != NV_OK) || (pP2PWriteCapStatus == NULL) ||
++        (pP2PReadCapStatus == NULL) || (pP2PAtomicsCapStatus == NULL) ||
++        (pConnectivity == NULL))
++    {
++        return status;
++    }
++
++    _barlinkPcieLogVerdict(gpuMask, "FINAL", *pConnectivity, *pP2PReadCapStatus,
++                           *pP2PWriteCapStatus, *pP2PAtomicsCapStatus, pCapsSource);
++
++    //
++    // If ForceP2P is armed, the override short circuits both PCIe helpers, so
++    // it is the real origin of the values no matter which branch reported them.
++    //
++    if (_smallbarP2pIsForceP2POverrideArmed(gpuMask, &forceP2POverride) &&
++        ((*pConnectivity == P2P_CONNECTIVITY_PCIE_PROPRIETARY) ||
++         (*pConnectivity == P2P_CONNECTIVITY_PCIE_BAR1)))
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "BARLINK_PCIE: p2pCapsVerdict[FINAL] gpuMask=0x%x : NOTE - "
++                  "ForceP2P=0x%x is armed, the values above were supplied by the "
++                  "regkey override, not by an evaluation\n",
++                  gpuMask, forceP2POverride);
++    }
++
++    return status;
++}
++
+ NV_STATUS
+ subdeviceCtrlCmdGetP2pCaps_VF
+ (
+diff --git a/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c b/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c
+index 2e2fbd5..f5c514b 100644
+--- a/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c
++++ b/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c
+@@ -2024,6 +2024,8 @@ static NV_STATUS queryFbInfo(struct gpuDevice *device)
+     device->fbInfo.bStaticBar1WriteCombined    = fbStaticBar1Params.bStaticBar1WriteCombined;
+     device->fbInfo.staticBar1StartOffset = fbStaticBar1Params.staticBar1StartOffset;
+     device->fbInfo.staticBar1Size        = fbStaticBar1Params.staticBar1Size;
++    // BARLINK_PCIE: FB offset the static BAR1 window starts at
++    device->fbInfo.staticBar1FbBase      = fbStaticBar1Params.staticBar1FbBase;
+ 
+ out:
+     portMemFree(fbRegionInfoParams);
+@@ -3146,6 +3148,36 @@ static NV_STATUS getNvlinkP2PCaps(struct gpuDevice *device1,
+ // TODO: Bug 3264814: [HOPPER][RM] Support Bar1 P2P PCIE Atomics
+ // The logic here should consider bus topology and routing between
+ // the two GPUs.
++/*!
++ * @brief BARLINK_PCIE: FB offset the peer's static BAR1 window starts at.
++ *
++ * kbusGetBar1P2PDmaInfo_HAL only returns base and size of the peer's BAR1
++ * DMA window. The FB offset the window maps is read straight off the peer's
++ * KernelBus here, which avoids changing the HAL signature (and with it the
++ * generated NVOC dispatch tables).
++ */
++static NvU64
++_nvGpuOpsGetPeerStaticBar1FbBase
++(
++    OBJGPU *pPeerGpu
++)
++{
++    KernelBus *pPeerKernelBus = GPU_GET_KERNEL_BUS(pPeerGpu);
++    NvU32      peerGfid;
++
++    if (pPeerKernelBus == NULL)
++    {
++        return 0;
++    }
++
++    if (vgpuGetCallingContextGfid(pPeerGpu, &peerGfid) != NV_OK)
++    {
++        peerGfid = GPU_GFID_PF;
++    }
++
++    return pPeerKernelBus->bar1[peerGfid].staticBar1.fbBase;
++}
++
+ NvBool _nvGpuOpsIsBar1P2pAtomicEnabled(struct gpuSession *session, OBJGPU *pMappingGpu, OBJGPU *pOwningGpu)
+ {
+     NvU32 arch;
+@@ -3194,6 +3226,9 @@ NV_STATUS nvGpuOpsGetP2PCaps(struct gpuDevice *device1,
+     p2pCapsParams->bar1DmaAddress[1]  = (NvU64)-1;
+     p2pCapsParams->bar1DmaSize[0]     = (NvU64)0;
+     p2pCapsParams->bar1DmaSize[1]     = (NvU64)0;
++    // BARLINK_PCIE: 0 == peer window starts at FB offset 0
++    p2pCapsParams->bar1DmaFbBase[0]   = (NvU64)0;
++    p2pCapsParams->bar1DmaFbBase[1]   = (NvU64)0;
+     p2pCapsParams->bar1PcieAtomics[0] = NV_FALSE;
+     p2pCapsParams->bar1PcieAtomics[1] = NV_FALSE;
+     p2pCapsParams->p2pLink         = UVM_LINK_TYPE_NONE;
+@@ -3264,6 +3299,9 @@ NV_STATUS nvGpuOpsGetP2PCaps(struct gpuDevice *device1,
+                                               &p2pCapsParams->bar1DmaAddress[0],
+                                               &p2pCapsParams->bar1DmaSize[0]),
+                     cleanup);
++                // BARLINK_PCIE: FB offset the remote window starts at
++                p2pCapsParams->bar1DmaFbBase[0] =
++                    _nvGpuOpsGetPeerStaticBar1FbBase(pRemoteGpu);
+                 p2pCapsParams->bar1PcieAtomics[0] = _nvGpuOpsIsBar1P2pAtomicEnabled(device1->session,
+                                                                                     pLocalGpu,
+                                                                                     pRemoteGpu);
+@@ -3276,6 +3314,9 @@ NV_STATUS nvGpuOpsGetP2PCaps(struct gpuDevice *device1,
+                                               &p2pCapsParams->bar1DmaAddress[1],
+                                               &p2pCapsParams->bar1DmaSize[1]),
+                     cleanup);
++                // BARLINK_PCIE: FB offset the local window starts at
++                p2pCapsParams->bar1DmaFbBase[1] =
++                    _nvGpuOpsGetPeerStaticBar1FbBase(pLocalGpu);
+                 p2pCapsParams->bar1PcieAtomics[1] = _nvGpuOpsIsBar1P2pAtomicEnabled(device2->session,
+                                                                                     pRemoteGpu,
+                                                                                     pLocalGpu);
+@@ -3841,13 +3882,27 @@ nvGpuOpsMemGetPageSize
+  *
+  * @param[in] pAddresses        : Array of physical addresses to be encoded.
+  * @param[in] dmaBaseAddress    : IOVA base address.
++ * @param[in] dmaFbBase         : FB offset the peer's static BAR1 window
++ *                                starts at (BARLINK_PCIE).
++ * @param[in] dmaSize           : Size of the peer BAR1 P2P window.
+  * @param[in] count             : Count of physical addresses.
++ *
++ * BARLINK_PCIE: the encoding assumes the target's FB physical address lies
++ * within the peer's static BAR1 window. That window neither starts at FB
++ * offset 0 nor covers the entire FB once BAR1 is smaller than the FB, so the
++ * mapping is
++ *     iova = dmaBaseAddress + (fbPhysAddr - dmaFbBase)
++ * valid for fbPhysAddr in [dmaFbBase, dmaFbBase + dmaSize). Addresses outside
++ * that range would point outside the peer's BAR1 and are rejected here with
++ * an error instead of producing a wrong target address.
+  */
+-static void
++static NV_STATUS
+ _nvGpuOpsEncodeBar1P2PAddrs
+ (
+     NvU64 *pAddresses,
+     NvU64  dmaBaseAddress,
++    NvU64  dmaFbBase,
++    NvU64  dmaSize,
+     NvU64  count
+ )
+ {
+@@ -3855,8 +3910,20 @@ _nvGpuOpsEncodeBar1P2PAddrs
+ 
+     for (i = 0; i < count; i++)
+     {
+-        pAddresses[i] = dmaBaseAddress + pAddresses[i];
++        if ((pAddresses[i] < dmaFbBase) ||
++            ((pAddresses[i] - dmaFbBase) >= dmaSize))
++        {
++            NV_PRINTF(LEVEL_ERROR, "BAR1P2P: FB offset 0x%llx outside peer static BAR1 "
++                                   "window FB [0x%llx, 0x%llx) of size 0x%llx\n",
++                                   pAddresses[i], dmaFbBase, dmaFbBase + dmaSize,
++                                   dmaSize);
++            return NV_ERR_INVALID_ADDRESS;
++        }
++
++        pAddresses[i] = dmaBaseAddress + (pAddresses[i] - dmaFbBase);
+     }
++
++    return NV_OK;
+ }
+ 
+ static
+@@ -4197,7 +4264,11 @@ nvGpuOpsBuildExternalAllocPtes
+             status = NV_ERR_INVALID_STATE;
+             goto done;
+         }
+-        _nvGpuOpsEncodeBar1P2PAddrs(physicalAddresses, dmaBaseAddress, pteCount);
++        NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR,
++                            _nvGpuOpsEncodeBar1P2PAddrs(physicalAddresses, dmaBaseAddress,
++                                                        _nvGpuOpsGetPeerStaticBar1FbBase(pRemoteGpu),
++                                                        dmaSize, pteCount),
++                            done);
+     }
+     else
+     {
+@@ -4531,7 +4602,11 @@ nvGpuOpsBuildExternalAllocPhysAddrs
+             status = NV_ERR_INVALID_STATE;
+             goto done;
+         }
+-        _nvGpuOpsEncodeBar1P2PAddrs(physicalAddresses, dmaBaseAddress, physAddrCount);
++        NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR,
++                            _nvGpuOpsEncodeBar1P2PAddrs(physicalAddresses, dmaBaseAddress,
++                                                        _nvGpuOpsGetPeerStaticBar1FbBase(pRemoteGpu),
++                                                        dmaSize, physAddrCount),
++                            done);
+     }
+     else
+     {

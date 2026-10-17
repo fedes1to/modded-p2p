@@ -1,0 +1,46 @@
+diff --git a/probes/dmabuf_pcie_probe.cpp b/probes/dmabuf_pcie_probe.cpp
+index 554f463..612b808 100644
+--- a/probes/dmabuf_pcie_probe.cpp
++++ b/probes/dmabuf_pcie_probe.cpp
+@@ -648,18 +648,18 @@ int main(int argc, char **argv)
+         if      (!std::strncmp(a, "--bytes=", 8))      bytes    = strtoull(a + 8, nullptr, 0);
+         else if (!std::strncmp(a, "--check=", 8))      checkLen = strtoull(a + 8, nullptr, 0);
+         else if (!std::strcmp (a, "--no-mr"))          imp      = IMP_NONE;
+-        else if (!std::strncmp(a, "--importer=", 12)) {
+-            std::string w = lower(a + 12);
++        else if (!std::strncmp(a, "--importer=", 11)) {
++            std::string w = lower(a + 11);
+             if      (w == "nic")    imp = IMP_NIC;
+             else if (w == "module")  imp = IMP_MODULE;
+             else if (w == "none" || w == "none" || w == "none") imp = IMP_NONE;
+             else { std::fprintf(stderr,
+                        "--importer: allowed values are nic, module, none (not '%s')\n",
+-                       a + 12); return 1; }
++                       a + 11); return 1; }
+         }
+         else if (!std::strncmp(a, "--nic=", 6))        nicName  = a + 6;
+         else if (!std::strncmp(a, "--holder=", 9))     holderPath   = a + 9;
+-        else if (!std::strncmp(a, "--hold-bdf=", 12)) attachBdfArg = a + 12;
++        else if (!std::strncmp(a, "--hold-bdf=", 11)) attachBdfArg = a + 11;
+         else if (!std::strcmp (a, "--none-sg-offset")) useSgOff = false;
+         else if (!std::strcmp (a, "--force-pcie"))     forcePcie= true;
+         else if (!std::strcmp (a, "--dereg-scan"))     deregScan= true;
+diff --git a/src/barlink/bar1.py b/src/barlink/bar1.py
+index 52303f6..90a0c06 100644
+--- a/src/barlink/bar1.py
++++ b/src/barlink/bar1.py
+@@ -2717,7 +2717,13 @@ class BarlinkBar1Transport:
+         window = bar1_window(dst_bdf)
+ 
+         # Attach happens as THIS card -- it will write later.
+-        handle_, sg, total = self._holder.hold(foreign_fd, self.bdfs[self.rank])
++        # Local port: BARLINK_BAR1_HOLD_BDF overrides the attaching device. The
++        # 615 driver rejects a GPU-class attaching device for FRAMEBUFFER
++        # dma-bufs ("NVRM: attaching GPU is not supported"), so on this rig the
++        # attach runs as a non-GPU busmaster (e.g. the NIC).
++        _hold_bdf = _env.environ.get("BARLINK_BAR1_HOLD_BDF", "").strip()
++        handle_, sg, total = self._holder.hold(foreign_fd,
++                                               _hold_bdf or self.bdfs[self.rank])
+ 
+         hits = [e for e in sg if window.base <= e.dma_address < window.end]
+         if not hits:
