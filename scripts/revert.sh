@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Undo modded-p2p completely: remove the persistent override and return to the
-# stock driver. Safe to run from a TTY if a boot went wrong.
+# Undo modded-p2p completely: remove the persistent override and all config,
+# return to the stock driver. Works with systemd, OpenRC and dinit.
+# Safe to run from a TTY if a boot went wrong.
 #
 #   sudo bash scripts/revert.sh
 set -euo pipefail
@@ -14,16 +15,24 @@ OVR="/lib/modules/$KVER/updates/barlink-p2p"
 step() { printf '\n==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 
-step "stopping GPU users"
 stopped=""
-for s in gdm sddm lightdm greetd ly ly@tty1 display-manager nvidia-persistenced; do
-  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$s" 2>/dev/null; then
-    systemctl stop "$s" && stopped="$stopped systemd:$s" && continue
-  fi
-  if command -v dinitctl >/dev/null 2>&1 && dinitctl status "$s" 2>/dev/null | grep -q started; then
-    dinitctl stop "$s" >/dev/null && stopped="$stopped dinit:$s"
-  fi
-done
+svc_active() {
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$1" 2>/dev/null; then echo systemd; return; fi
+  if command -v dinitctl  >/dev/null 2>&1 && dinitctl status "$1" 2>/dev/null | grep -q started; then echo dinit; return; fi
+  if command -v rc-service >/dev/null 2>&1 && rc-service "$1" status >/dev/null 2>&1; then echo openrc; return; fi
+}
+svc_stop() {
+  local who; who="$(svc_active "$1")"; [ -n "$who" ] || return 1
+  case "$who" in
+    systemd) systemctl stop "$1" ;;
+    dinit)   dinitctl stop "$1" >/dev/null ;;
+    openrc)  rc-service "$1" stop ;;
+  esac
+  stopped="$stopped $who:$1"
+}
+
+step "stopping GPU users"
+for s in gdm sddm lightdm greetd ly ly@tty1 display-manager nvidia-persistenced; do svc_stop "$s" || true; done
 pkill -TERM -f 'Hyprland|sway|kwin_wayland|gnome-shell|Xorg|startplasma|plasmashell' 2>/dev/null || true
 pkill -TERM -f nvidia-persistenced 2>/dev/null || true
 sleep 2
@@ -34,7 +43,7 @@ for m in dmabuf_holder nvidia_uvm nvidia_drm nvidia_modeset nvidia; do
 done
 if lsmod | grep -qE '^nvidia'; then
   warn "modules still loaded (a process holds /dev/nvidia*)."
-  warn "Persistent override will be removed anyway; reboot to finish."
+  warn "The persistent override is removed anyway; reboot to finish."
 else
   for d in /sys/bus/pci/devices/*; do
     cls="$(cat "$d/class" 2>/dev/null)" || continue
@@ -46,11 +55,17 @@ else
   sleep 2
 fi
 
-step "removing the persistent override"
+step "removing the persistent override and config"
 rm -rf "$OVR"
-rm -f /etc/modprobe.d/barlink-p2p.conf /etc/modules-load.d/barlink-p2p.conf \
-      /etc/barlink-p2p.hold-bdf /etc/profile.d/barlink-p2p.sh \
-      /etc/barlink-p2p.env
+rm -f /etc/modprobe.d/barlink-p2p.conf \
+      /etc/modules-load.d/barlink-p2p.conf \
+      /etc/dinit.d/barlink-holder \
+      /etc/dinit.d/boot.d/barlink-holder \
+      /etc/barlink-p2p.hold-bdf \
+      /etc/barlink-p2p.env \
+      /etc/profile.d/barlink-p2p.sh
+[ -f /etc/conf.d/modules ] && sed -i '/dmabuf_holder/d' /etc/conf.d/modules 2>/dev/null || true
+[ -f /etc/modules ] && sed -i '/^dmabuf_holder$/d' /etc/modules 2>/dev/null || true
 depmod -a "$KVER"
 
 step "restoring the stock driver"
@@ -71,6 +86,7 @@ for s in $stopped; do
   case "$s" in
     systemd:*) systemctl start "${s#systemd:}" 2>/dev/null || true ;;
     dinit:*)   dinitctl start "${s#dinit:}" 2>/dev/null || true ;;
+    openrc:*)  rc-service "${s#openrc:}" start 2>/dev/null || true ;;
   esac
 done
 

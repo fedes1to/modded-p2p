@@ -9,6 +9,7 @@ into a reproducible install for one class of machine — Ampere/Ada cards whose
 BAR1 is smaller than their VRAM (e.g. RTX 3080, 256 MiB BAR1 against 20 GiB of
 memory). It contains **only patches and scripts**. It never ships NVIDIA code,
 never ships a binary driver, and never touches your card's firmware.
+It works on **systemd, OpenRC and dinit** hosts.
 
 ## Credit where it is due
 
@@ -54,6 +55,7 @@ faster than NCCL, with **zero bad bytes** in both directions. Details:
 | `git`, `patch`, `make`, `python3` | build |
 | ~2 GB disk (+ ~3 GB if you want the optional Python checks) | source + build |
 | Two NVIDIA GPUs of the same generation | P2P needs a pair |
+| systemd, OpenRC or dinit | the scripts detect your init: service control for the display/persistenced, and a boot hook that loads the holder module |
 | Root | loading a kernel module |
 
 Tested: Arch Linux, kernel 7.2.9-zen, driver 615.78.08, 2× GA102 (RTX 3080).
@@ -103,7 +105,7 @@ kernel upgrade it boots the stock driver until you re-run the installer.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `rmmod: nvidia_modeset is in use` | `nvidia-persistenced` keeps `/dev/nvidia*` open | `install.sh` stops it; if you do it by hand: `systemctl stop nvidia-persistenced` (or `dinitctl stop`) |
-| `dmabuf_holder` attach fails with `ENOTSUPP` and dmesg says `NVRM: attaching GPU is not supported` | 615-class drivers refuse FRAMEBUFFER dma-bufs attached as a **GPU** | attach as a non-GPU busmaster — `install.sh` auto-detects one and exports `BARLINK_BAR1_HOLD_BDF`; override it if needed |
+| `dmabuf_holder` attach fails with `ENOTSUPP` and dmesg says `NVRM: attaching GPU is not supported` | 615-class drivers refuse FRAMEBUFFER dma-bufs attached as a **GPU** | attach as a non-GPU busmaster — the installer auto-detects a NIC or NVMe controller and exports `BARLINK_BAR1_HOLD_BDF`; override it if you want a specific device |
 | Export fails with `NV_ERR_INVALID_LOCK_STATE` | static BAR1 forced on a small-BAR card | do **not** pass `RMStaticBar1LocalForce` — `install.sh` doesn't |
 | `mmap(resource1_wc): EINVAL` | kernel with `CONFIG_IO_STRICT_DEVMEM=y`: a driver-claimed BAR cannot be mmap'd from sysfs. BAR1 of the peer is unclaimed, so it works; seeing this on `resource0` is expected | none needed; do not mmap BAR0 |
 | Marker count ≠ 37 after build | wrong tag or a partially applied patch | `git -C /opt/modded-p2p/build/driver-* diff --stat` → should be 21 files, +1805/−57 |

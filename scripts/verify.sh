@@ -22,6 +22,7 @@ ok()   { printf 'ok:   %s\n' "$*"; }
 RC=0
 
 step "loaded module vs built module"
+modprobe dmabuf_holder 2>/dev/null || true
 LOADED="$(cat /sys/module/nvidia/srcversion 2>/dev/null || true)"
 BUILT="$(modinfo "$DRIVER_DIR/kernel-open/nvidia.ko" | awk '/^srcversion:/{print $2}')"
 if [ -n "$LOADED" ] && [ "$LOADED" = "$BUILT" ]; then ok "srcversion $LOADED"; else fail "srcversion mismatch (loaded='${LOADED:-none}' built='$BUILT')"; fi

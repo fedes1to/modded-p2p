@@ -115,7 +115,26 @@ cat > /etc/modprobe.d/barlink-p2p.conf <<'EOF'
 # the stock module, so a kernel update cannot make the machine unbootable.
 options nvidia NVreg_RegistryDwords="BarlinkPeerBar1=1;RMPcieP2PType=1"
 EOF
-echo dmabuf_holder > /etc/modules-load.d/barlink-p2p.conf
+# load the holder module at boot, whatever the init is
+if [ -d /etc/dinit.d ]; then
+  cat > /etc/dinit.d/barlink-holder <<'EOF'
+type = scripted
+command = /usr/bin/modprobe dmabuf_holder
+restart = false
+EOF
+  ln -sf ../barlink-holder /etc/dinit.d/boot.d/barlink-holder
+else
+  mkdir -p /etc/modules-load.d 2>/dev/null || true
+  [ -d /etc/modules-load.d ] && echo dmabuf_holder > /etc/modules-load.d/barlink-p2p.conf
+fi
+if command -v rc-update >/dev/null 2>&1; then          # OpenRC / Gentoo
+  touch /etc/conf.d/modules
+  grep -q dmabuf_holder /etc/conf.d/modules || echo 'modules="$modules dmabuf_holder"' >> /etc/conf.d/modules
+  rc-update add modules boot >/dev/null 2>&1 || true
+fi
+if [ -f /etc/modules ] && ! grep -q '^dmabuf_holder' /etc/modules; then
+  echo dmabuf_holder >> /etc/modules                    # inits that read it directly
+fi
 
 # a non-GPU PCI device the dma-bufs are attached as (615-class drivers refuse
 # a GPU as the attaching device)
@@ -173,23 +192,24 @@ fi
 if [ "$ACTIVATE" = 1 ]; then
   step "activating now (display freezes for a few seconds)"
   stopped=""
-  stop_service() {
-    local s="$1"
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$s" 2>/dev/null; then
-      systemctl stop "$s" && stopped="$stopped systemd:$s" && return
-    fi
-    if command -v dinitctl >/dev/null 2>&1 && dinitctl status "$s" 2>/dev/null | grep -q started; then
-      dinitctl stop "$s" >/dev/null && stopped="$stopped dinit:$s"
-    fi
+  svc_active() {   # $1 = service name -> echoes the init that has it running
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$1" 2>/dev/null; then echo systemd; return; fi
+    if command -v dinitctl  >/dev/null 2>&1 && dinitctl status "$1" 2>/dev/null | grep -q started; then echo dinit; return; fi
+    if command -v rc-service >/dev/null 2>&1 && rc-service "$1" status >/dev/null 2>&1; then echo openrc; return; fi
   }
-  for s in gdm sddm lightdm greetd ly ly@tty1 display-manager; do stop_service "$s"; done
+  svc_stop() {     # $1 = service name
+    local who; who="$(svc_active "$1")"; [ -n "$who" ] || return 1
+    case "$who" in
+      systemd) systemctl stop "$1" ;;
+      dinit)   dinitctl stop "$1" >/dev/null ;;
+      openrc)  rc-service "$1" stop ;;
+    esac
+    stopped="$stopped $who:$1"
+  }
+  for s in gdm sddm lightdm greetd ly ly@tty1 display-manager nvidia-persistenced; do svc_stop "$s" || true; done
   pkill -TERM -f 'Hyprland|sway|kwin_wayland|gnome-shell|Xorg|startplasma|plasmashell' 2>/dev/null || true
-  sleep 2
   pkill -TERM -f nvidia-persistenced 2>/dev/null || true
-  if command -v dinitctl >/dev/null 2>&1 && dinitctl status nvidia-persistenced 2>/dev/null | grep -q started; then
-    dinitctl stop nvidia-persistenced >/dev/null 2>&1 || true
-  fi
-  sleep 1
+  sleep 2
 
   for m in dmabuf_holder nvidia_uvm nvidia_drm nvidia_modeset nvidia; do
     rmmod "$m" 2>/dev/null && echo "rmmod $m ok"
@@ -226,10 +246,9 @@ if [ "$ACTIVATE" = 1 ]; then
     case "$s" in
       systemd:*) systemctl start "${s#systemd:}" 2>/dev/null || true ;;
       dinit:*)   dinitctl start "${s#dinit:}" 2>/dev/null || true ;;
+      openrc:*)  rc-service "${s#openrc:}" start 2>/dev/null || true ;;
     esac
   done
-  if command -v dinitctl >/dev/null 2>&1; then dinitctl start nvidia-persistenced >/dev/null 2>&1 || true
-  elif command -v systemctl >/dev/null 2>&1; then systemctl start nvidia-persistenced 2>/dev/null || true; fi
 fi
 
 step "installed"
