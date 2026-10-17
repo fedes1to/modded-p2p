@@ -146,4 +146,9 @@ scripts/ install.sh verify.sh revert.sh
 docs/    DETAILS.md PERFORMANCE.md
 ```
 
-Licenses and what may be redistributed: [LICENSE-NOTES.md](LICENSE-NOTES.md).
+## License
+
+This repository's own files (scripts, docs, README) are **GPL-3.0** — see
+[LICENSE](LICENSE). The patches keep their upstream licenses (NVIDIA's files:
+MIT/GPLv2; barlink-pcie's files: Apache-2.0); details in
+[LICENSE-NOTES.md](LICENSE-NOTES.md).
