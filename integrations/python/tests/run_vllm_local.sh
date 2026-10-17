@@ -22,15 +22,10 @@ export MODDED_P2P_VLLM=1
 export BARLINK_TRANSPORT="${BARLINK_TRANSPORT:-bar1}"
 PY="${PY:-python3}"
 
-EXTRA=()
-[ -n "${HOST:-}" ] && EXTRA+=(--host "$HOST")
-[ -n "${API_KEY:-}" ] && EXTRA+=(--api-key "$API_KEY")
-
 exec "$PY" -m vllm.entrypoints.openai.api_server \
   --model "$MODEL" \
   --tensor-parallel-size "${TP:-2}" \
   --disable-custom-all-reduce \
   --gpu-memory-utilization "${GPU_UTIL:-0.85}" \
   --port "${PORT:-8000}" \
-  "${EXTRA[@]}" \
   "$@"
