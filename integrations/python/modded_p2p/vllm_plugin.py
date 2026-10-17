@@ -22,3 +22,34 @@ def register() -> None:
     from modded_p2p import activate
 
     activate(map_backends=True)
+    _force_torch_allreduce()
+    print("modded_p2p: vLLM plugin active -- nccl groups mapped to barlink", flush=True)
+
+
+def _force_torch_allreduce() -> None:
+    """Route vLLM's TP all-reduce through ``torch.distributed``.
+
+    vLLM 0.31 dispatches all-reduce through its own backends (PYNCCL,
+    flashinfer, quick-reduce, custom, symmetric memory) and only falls back to
+    ``torch.distributed.all_reduce`` when none applies. Those backends bypass
+    the process group, and with it barlink. Replacing the communicator's
+    ``all_reduce`` with the documented in-tree fallback (clone + distributed
+    all_reduce, same out-of-place semantics vLLM expects) is what makes the
+    barlink backend the transport.
+    """
+    try:
+        from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
+    except Exception:  # vLLM not importable / other version: nothing to patch
+        return
+    if getattr(CudaCommunicator, "_modded_p2p_patched", False):
+        return
+
+    import torch.distributed as dist
+
+    def all_reduce(self, input_):
+        out = input_.clone()
+        dist.all_reduce(out, group=self.device_group)
+        return out
+
+    CudaCommunicator.all_reduce = all_reduce
+    CudaCommunicator._modded_p2p_patched = True

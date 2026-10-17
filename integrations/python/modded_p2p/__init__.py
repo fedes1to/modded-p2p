@@ -60,7 +60,13 @@ def activate(map_backends: bool = True) -> None:
         dist._modded_p2p_original_new_group = dist.new_group
 
         def init_process_group(backend=None, *args, **kwargs):
-            return dist._modded_p2p_original_init(_mapped(backend), *args, **kwargs)
+            result = dist._modded_p2p_original_init(_mapped(backend), *args, **kwargs)
+            try:
+                print(f"modded_p2p: process group created, resolved backend={dist.get_backend()}",
+                      flush=True)
+            except Exception:
+                pass
+            return result
 
         def new_group(ranks=None, **kwargs):
             if "backend" in kwargs:

@@ -50,12 +50,24 @@ Notes:
   `osIsAdministrator()`; the registry alternative is `PeerMappingOverride=1`.
 - Every rank needs identical `BARLINK_*` values — a rank mismatch hangs, it does
   not error.
-- vLLM's own CUDA-IPC custom all-reduce self-disables on rigs without peer
-  access; keep `--disable-custom-all-reduce` so the barlink path is the one used.
+- **vLLM 0.31 has its own all-reduce dispatch** (PYNCCL, flashinfer,
+  quick-reduce, custom, symmetric memory) that bypasses the process group;
+  `--disable-custom-all-reduce` alone does not reach barlink. The plugin
+  replaces `CudaCommunicator.all_reduce` with vLLM's own documented fallback
+  (`clone` + `torch.distributed.all_reduce`), which lands on the barlink
+  backend.
+- **Proof line:** each worker prints
+  `modded_p2p: process group created, resolved backend=barlink`.
+- The plugin also fixes barlink's abort-gate under `torch.inference_mode()`
+  (vLLM's execution context): inference tensors may only be mutated inside
+  InferenceMode, so the watchdog re-enters it. Carried by
+  `patches/barlink-platform-fixes.patch`.
 - Scope: tensor-parallel collectives (`all_reduce`, `all_gather`, `broadcast`,
   `reduce_scatter`, `barrier`). Pipeline-parallel `send`/`recv` is not part of
   the backend's op set.
 - First start JIT-builds the extension once (needs `CUDA_HOME`).
+- Tiny test models: cap `--max-num-seqs` (e.g. 4) — vLLM's flex-attention
+  backend sizes buffers per sequence and can OOM on defaults.
 
 ## sglang
 
