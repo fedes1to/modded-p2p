@@ -94,6 +94,20 @@ environment switch. barlink also ships a dedicated sglang adapter
 (`barlink.integrations.sglang`) for code that calls `BarlinkCommunicator`
 directly instead of using a torch process group.
 
+## Local model directories
+
+Both helpers accept a local checkpoint directory, change into it, and start the
+server with the direct path enabled:
+
+```bash
+sudo -E bash integrations/python/tests/run_vllm_local.sh  /path/to/model [vllm args...]
+sudo -E bash integrations/python/tests/run_sglang_local.sh /path/to/model [sglang args...]
+```
+
+Overrides through the environment: `TP` (default 2), `PORT`, `GPU_UTIL`
+(vLLM), `PY` (interpreter that has the framework installed). Extra arguments
+are passed through, e.g. `--max-model-len 8192 --max-num-seqs 2`.
+
 ## Verifying the direct path without a framework
 
 ```bash
