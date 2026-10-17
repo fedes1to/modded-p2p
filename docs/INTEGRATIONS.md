@@ -113,6 +113,24 @@ needed for guided/JSON-schema decoding; the workaround is
 `outlines`/`outlines-core`, then run unconstrained generation — or use a
 Python 3.13 environment.
 
+### Status on this rig (Python 3.14, CUDA 13) — blocked upstream
+
+Attempted end to end; the binary packages cannot be aligned on this
+interpreter, independently of barlink:
+
+- `sglang==0.5.22` has no installable distribution for this Python (pip offers
+  only ≤0.4.2/0.5.10); the newest installable is `0.5.10.post1`.
+- `sglang 0.5.10.post1` requires `sglang-kernel==0.4.1`. The PyPI wheel ships
+  only `sm100` `common_ops` (needs spurious `libnvrtc.so.12`/`libcublas.so.12`
+  CUDA-12 libs); the vendor cu130-index wheel for 0.4.1 resolves the ABI but
+  still exposes only the `sm100` variant and fails on sm_86 with an undefined
+  `c10::cuda` symbol against torch 2.14.
+- `sglang-kernel==0.4.9` (cu130 index) imports cleanly, but renames
+  `fp8_blockwise_scaled_mm` → `sglang 0.5.10` imports the old name and fails.
+
+Conclusion: run sglang on Python 3.12/3.13 (its supported matrix) — the shim,
+launcher and smoke test here need no changes there.
+
 ## Verifying the seam without a framework
 
 ```bash
