@@ -63,6 +63,15 @@ Notes:
   exclusion now waits for a poll already on a device, and a poll that starts
   after the pause re-checks it under the same gate. Without that gate one
   in-flight poll can still invalidate a long startup sequence of captures.
+- `patches/barlink-baton-marker-state.patch` stops a **queued** rank from
+  vetoing the reclaim of a dead builder's `lock`. The
+  `.barlink_jit_building` marker is written before torch's `FileBaton` is
+  even attempted, so it said "compiling" about a process that was only
+  waiting; with two TP ranks behind one abandoned lock, each kept the
+  other's veto alive and both sat out the full 30-minute limit next to a
+  finished `.so`. The marker now carries `waiting` or `building` and only
+  `building` vetoes; it is flipped when `try_acquire`/`wait` wins the lock,
+  which is the only moment the claim is true.
 - Scope: tensor-parallel collectives (`all_reduce`, `all_gather`, `broadcast`,
   `reduce_scatter`, `barrier`). Pipeline-parallel `send`/`recv` is not part of
   the backend's op set.

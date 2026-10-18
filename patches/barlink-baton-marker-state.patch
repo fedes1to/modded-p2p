@@ -1,0 +1,257 @@
+diff --git a/src/barlink/_compat/jit_kernel/baton_health.py b/src/barlink/_compat/jit_kernel/baton_health.py
+index 5920341..1a24dcf 100644
+--- a/src/barlink/_compat/jit_kernel/baton_health.py
++++ b/src/barlink/_compat/jit_kernel/baton_health.py
+@@ -81,6 +81,17 @@ and 3: that marker exists precisely to say "a co-located rank is compiling
+ here". Rule 4 still applies, since the marker's own staleness bound is longer
+ than the wait limit.
+ 
++The marker has to be in its ``building`` state to veto. It is written BEFORE
++the baton is attempted (``barlink.device`` wraps the whole ``load_inline``),
++so a marker on its own only says "this rank is in the build path". A rank
++queued behind the very lock being judged is not compiling anything, and if it
++vetoed, two such waiters would keep each other's veto alive for the full
++limit -- the observed failure was exactly that: a killed builder's lock plus
++two vLLM TP ranks waiting the whole 30 minutes out. ``try_acquire`` /
++``wait`` flip the marker to ``building`` the moment the lock is won, which is
++the only point at which the claim is true. A marker with no state line (the
++fork's spelling) is read as ``building``: conservative, never under-protects.
++
+ Reclaiming is a rename, then a delete. ``os.rename`` is atomic, so exactly one
+ of N concurrent waiters observes the lock and removes it; the others get
+ ENOENT and take rule 1 on their next poll. ``release()`` is patched alongside
+@@ -285,6 +296,17 @@ def _live_build_marker(build_dir: Path) -> bool:
+         info = cache_health._read_marker(marker)
+         if info is None:
+             return False
++        # The marker is written before the lock is even attempted, so on its
++        # own it means "this rank is in the build path", not "this rank is
++        # compiling". A rank that is QUEUED behind the very lock being judged
++        # must not veto reclaiming it: two waiters behind one dead lock would
++        # each keep the other's veto alive until the 30-minute limit (which is
++        # exactly the vLLM startup stall this state line was added for). Only
++        # the process that has won the lock flips the line to ``building``;
++        # see ``cache_health.mark_building``.
++        state = cache_health.marker_state(marker)
++        if state and state != cache_health.MARKER_STATE_BUILDING:
++            return False
+         host, pid = info
+         # Another host on a shared cache volume: its pid means nothing here,
+         # so freshness has to carry it -- bounded by the staleness check above.
+@@ -387,6 +409,21 @@ def claim_baton(lock_path: PathLike) -> bool:
+     return True
+ 
+ 
++def _note_holding(lock_path: PathLike) -> None:
++    """Tell the cache that this process is past the lock and about to compile.
++
++    Best-effort by construction: a hygiene failure must never be the reason a
++    build fails, and a build path with no marker at all (a plain ``load()``
++    that did not go through ``barlink.device``) has nothing to flip.
++    """
++    try:
++        from barlink._compat.jit_kernel import cache_health
++
++        cache_health.mark_building(Path(lock_path).parent)
++    except Exception:  # noqa: BLE001 - see the docstring
++        pass
++
++
+ def _selfhealing_wait(baton) -> None:
+     """Replacement for ``FileBaton.wait``. Bounded, and never silent."""
+     lock = Path(baton.lock_file_path)
+@@ -417,6 +454,7 @@ def _selfhealing_wait(baton) -> None:
+         )
+ 
+         if verdict.action == "released":
++            _note_holding(lock)
+             return
+ 
+         if verdict.action == "reclaim":
+@@ -431,6 +469,7 @@ def _selfhealing_wait(baton) -> None:
+                     time.time() - started,
+                     verdict.reason,
+                 )
++            _note_holding(lock)
+             return
+ 
+         if verdict.action == "fail":
+@@ -495,6 +534,13 @@ def install_baton_selfheal() -> bool:
+     called from inside ``_jit_compile``, several frames below every
+     ``load()`` / ``load_inline()`` in this package and in torch itself, so
+     there is no argument to pass and no wrapper to interpose from outside.
++
++    ``try_acquire()`` is patched alongside it, and not for symmetry:
++    ``_jit_compile`` gives the lock to whoever wins ``try_acquire`` and only
++    calls ``wait()`` for the losers, so a builder that never waits is a
++    builder whose build marker would otherwise stay in the "waiting" state --
++    the state that stops a live marker from vetoing a reclaim. Both paths into
++    a build have to say "building".
+     """
+     global _installed
+     if _installed:
+@@ -502,9 +548,16 @@ def install_baton_selfheal() -> bool:
+     try:
+         from torch.utils.file_baton import FileBaton
+ 
++        stock_try_acquire = FileBaton.try_acquire
+         stock_wait = FileBaton.wait
+         stock_release = FileBaton.release
+ 
++        def try_acquire(self) -> bool:
++            got = stock_try_acquire(self)
++            if got:
++                _note_holding(self.lock_file_path)
++            return bool(got)
++
+         def wait(self) -> None:
+             _selfhealing_wait(self)
+ 
+@@ -512,9 +565,11 @@ def install_baton_selfheal() -> bool:
+             _tolerant_release(self)
+ 
+         # Kept reachable so the falsifier test can still exercise stock torch.
++        try_acquire.__wrapped__ = stock_try_acquire
+         wait.__wrapped__ = stock_wait
+         release.__wrapped__ = stock_release
+ 
++        FileBaton.try_acquire = try_acquire
+         FileBaton.wait = wait
+         FileBaton.release = release
+         _installed = True
+diff --git a/src/barlink/_compat/jit_kernel/cache_health.py b/src/barlink/_compat/jit_kernel/cache_health.py
+index e069fec..703b9ff 100644
+--- a/src/barlink/_compat/jit_kernel/cache_health.py
++++ b/src/barlink/_compat/jit_kernel/cache_health.py
+@@ -133,6 +133,21 @@ logger = logging.getLogger(__name__)
+ 
+ #: Written while a build is running; removed when it finishes either way.
+ MARKER_BUILDING = ".barlink_jit_building"
++
++#: The last line of the in-progress marker. The marker is written BEFORE
++#: torch's build lock is even attempted, so on its own it cannot tell
++#: "compiling" from "queued behind somebody else's lock". ``baton_health``
++#: needs that distinction: a queued waiter must not veto reclaiming an
++#: abandoned lock, or every waiter behind one dead lock keeps every other one
++#: waiting -- measured on vLLM startup, where two ranks sat out the full
++#: 30-minute limit on a lock whose builder had been killed. ``baton_health``
++#: rewrites this line the moment it wins the lock. A marker with no state
++#: line (the fork's two-line spelling, and anything a future writer adds) is
++#: read as ``building``: the conservative answer, which waits rather than
++#: reclaims.
++MARKER_STATE_BUILDING = "building"
++MARKER_STATE_WAITING = "waiting"
++
+ #: Written after a successful build. Advisory only -- the artifact is the
+ #: truth, so entries built before this change stay valid.
+ MARKER_COMPLETE = ".barlink_jit_complete"
+@@ -257,6 +272,55 @@ def find_building_marker(path: PathLike) -> Optional[Path]:
+     return None
+ 
+ 
++def marker_state(path: PathLike) -> str:
++    """The state line of a marker file, or ``""`` when it carries none.
++
++    ``""`` is not "waiting": it is "unknown", and :mod:`baton_health` reads it
++    as ``building`` so that a marker written by a version of this module (or
++    by the fork) that predates the state line keeps its veto. Never raises.
++    """
++    try:
++        lines = Path(path).read_text().split("\n")
++    except OSError:
++        return ""
++    return lines[3].strip() if len(lines) > 3 else ""
++
++
++def mark_building(path: PathLike) -> bool:
++    """Flip THIS process's in-progress marker in ``path`` to ``building``.
++
++    Called by :mod:`baton_health` once the build lock is won -- both by the
++    winner of ``try_acquire`` and by a waiter the baton admitted. Until then
++    the marker says ``waiting``, which is the truth: the process has entered
++    the build path but owns no lock and is compiling nothing. See
++    :data:`MARKER_STATE_BUILDING` for the stall that distinction removes.
++
++    Does nothing when there is no marker, or when the marker belongs to
++    another process: rewriting a peer's marker would disarm the veto that
++    protects a real builder. Never raises -- the state line is one module's
++    input, and a build must never fail over it.
++    """
++    p = Path(path)
++    marker = find_building_marker(p)
++    if marker is None:
++        return False
++    info = _read_marker(marker)
++    if info is None or info[1] != os.getpid():
++        return False
++    try:
++        lines = marker.read_text().split("\n")
++    except OSError:
++        return False
++    host = lines[0] if lines and lines[0].strip() else _hostname()
++    pid = lines[1] if len(lines) > 1 and lines[1].strip() else str(os.getpid())
++    stamp = lines[2] if len(lines) > 2 and lines[2].strip() else str(time.time())
++    try:
++        marker.write_text(f"{host}\n{pid}\n{stamp}\n{MARKER_STATE_BUILDING}\n")
++    except OSError:
++        return False
++    return True
++
++
+ def _has_artifact(path: Path, suffixes: Sequence[str]) -> bool:
+     try:
+         return any(child.suffix in suffixes for child in path.iterdir())
+@@ -585,9 +649,19 @@ def sweep_cache_root(
+ 
+ 
+ @contextmanager
+-def building_marker(path: PathLike) -> Iterator[Path]:
++def building_marker(
++    path: PathLike, *, state: str = MARKER_STATE_BUILDING
++) -> Iterator[Path]:
+     """Mark ``path`` as a build in progress for the duration of the block.
+ 
++    ``state`` is written as the marker's last line and is what
++    :mod:`baton_health` reads before letting a live marker veto reclaiming an
++    abandoned lock. Callers that hold the guarded region around the whole
++    ``load()`` -- which includes the wait for the lock -- must pass
++    ``MARKER_STATE_WAITING``: they are not compiling yet, and a marker that
++    claims they are is a lie with a 30-minute price tag. Once the lock is won,
++    :func:`mark_building` flips the line.
++
+     On success the marker is replaced by a completeness marker; on failure it
+     is simply removed, so the directory is immediately recognisable as poison
+     instead of masquerading as somebody's live build until the staleness bound
+@@ -598,7 +672,7 @@ def building_marker(path: PathLike) -> Iterator[Path]:
+     p.mkdir(parents=True, exist_ok=True)
+     marker = p / MARKER_BUILDING
+     try:
+-        marker.write_text(f"{_hostname()}\n{os.getpid()}\n{time.time()}\n")
++        marker.write_text(f"{_hostname()}\n{os.getpid()}\n{time.time()}\n{state}\n")
+     except OSError:  # pragma: no cover - unwritable cache; let the build try
+         marker = None
+     ok = False
+diff --git a/src/barlink/device.py b/src/barlink/device.py
+index d08dce1..b9b6025 100644
+--- a/src/barlink/device.py
++++ b/src/barlink/device.py
+@@ -842,7 +842,18 @@ def _ext_cache_guarded(name: str):
+                 artifact_suffixes=_EXT_ARTIFACT_SUFFIXES,
+                 label=_EXT_CACHE_LABEL,
+             )
+-        marker = cache_health.building_marker
++
++        def marker(path):
++            # "waiting", not "building": this marker is entered before
++            # ``load_inline`` even attempts the baton, so the process may
++            # spend the whole window queued behind somebody else's lock. The
++            # baton patch flips the state to "building" the moment the lock is
++            # won, and ``baton_health`` only lets a "building" marker veto a
++            # reclaim -- otherwise two waiters behind one dead lock keep each
++            # other waiting until the 30-minute limit.
++            return cache_health.building_marker(
++                path, state=cache_health.MARKER_STATE_WAITING
++            )
+     except Exception as exc:  # never fail a boot on cache hygiene
+         logger.warning("barlink extension cache self-heal skipped: %r", exc)
+         build_dir = None

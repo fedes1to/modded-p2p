@@ -89,7 +89,7 @@ code runs).
 
 | Script | Run as | Effect |
 |---|---|---|
-| `scripts/install.sh` | root | clones NVIDIA's module source at the pinned tag, applies `patches/BARLINK_PCIE-615.78.08.patch`, builds it; clones barlink-pcie, applies `patches/barlink-platform-fixes.patch`, `patches/barlink-inference-mode.patch` and `patches/barlink-capture-gate.patch`, builds `dmabuf_holder`; installs the modules as a persistent override, writes the keys, activates now. Idempotent — re-run after a kernel upgrade |
+| `scripts/install.sh` | root | clones NVIDIA's module source at the pinned tag, applies `patches/BARLINK_PCIE-615.78.08.patch`, builds it; clones barlink-pcie, applies `patches/barlink-platform-fixes.patch`, `patches/barlink-inference-mode.patch`, `patches/barlink-capture-gate.patch` and `patches/barlink-baton-marker-state.patch`, builds `dmabuf_holder`; installs the modules as a persistent override, writes the keys, activates now. Idempotent — re-run after a kernel upgrade |
 | `scripts/verify.sh` | root | compiles and runs the byte-proof probe (both directions, `bad_bytes` must be 0); checks the loaded module, keys, holder, and optionally runs barlink's own `preflight` |
 | `scripts/revert.sh` | root | removes the override and all config, returns to the stock driver |
 
@@ -170,6 +170,7 @@ barlink's own
 patches/
   BARLINK_PCIE-615.78.08.patch     driver patch (barlink-pcie's, ported to 615.78.08)
   barlink-platform-fixes.patch     two probe-flag fixes + BARLINK_BAR1_HOLD_BDF support
+  barlink-baton-marker-state.patch JIT build lock: a queued waiter is not a builder
 scripts/ install.sh verify.sh revert.sh
 docs/    DETAILS.md PERFORMANCE.md
 ```
