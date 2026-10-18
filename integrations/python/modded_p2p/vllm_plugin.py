@@ -13,6 +13,7 @@ all-reduce auto-disables itself on rigs without peer access; keep it disabled
 from __future__ import annotations
 
 import os
+import sys
 
 
 def register() -> None:
@@ -23,6 +24,7 @@ def register() -> None:
 
     activate(map_backends=True)
     _force_torch_allreduce()
+    _pause_abort_polling_during_capture()
     print("modded_p2p: vLLM plugin active -- nccl groups mapped to barlink", flush=True)
 
 
@@ -53,3 +55,53 @@ def _force_torch_allreduce() -> None:
 
     CudaCommunicator.all_reduce = all_reduce
     CudaCommunicator._modded_p2p_patched = True
+
+
+def _pause_abort_polling_during_capture() -> None:
+    """Keep BAR1's abort watchdog out of torch CUDA-graph capture.
+
+    barlink's watchdog reads a status word on a private stream and synchronizes
+    that stream. CUDA forbids synchronizing *any* stream while a capture is in
+    progress, so a poll that happens to land inside ``torch.cuda.graph``
+    invalidates the capture with ``cudaErrorStreamCaptureUnsupported``. vLLM
+    captures several graphs during startup, which made the failure look like an
+    engine-init error with no obvious cause.
+
+    ``barlink.abort_gate.pause_polling()`` is the transport's own reentrant
+    exclusion for exactly this; the plugin enters it around the one context
+    manager that wraps every capture in the process.
+    """
+    try:
+        from barlink import abort_gate
+        from torch.cuda.graphs import graph as graph_capture
+    except Exception:  # barlink or torch version without the hook: leave as-is
+        return
+    if getattr(graph_capture, "_modded_p2p_abort_pause", False):
+        return
+
+    original_enter = graph_capture.__enter__
+    original_exit = graph_capture.__exit__
+
+    def enter(self):
+        pause = abort_gate.pause_polling()
+        pause.__enter__()
+        self._modded_p2p_pause = pause
+        try:
+            return original_enter(self)
+        except BaseException:
+            self._modded_p2p_pause = None
+            pause.__exit__(*sys.exc_info())
+            raise
+
+    def exit(self, *exc):
+        try:
+            return original_exit(self, *exc)
+        finally:
+            pause = getattr(self, "_modded_p2p_pause", None)
+            self._modded_p2p_pause = None
+            if pause is not None:
+                pause.__exit__(*exc)
+
+    graph_capture.__enter__ = enter
+    graph_capture.__exit__ = exit
+    graph_capture._modded_p2p_abort_pause = True

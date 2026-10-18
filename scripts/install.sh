@@ -88,12 +88,25 @@ else
   echo "present: $BARLINK_DIR"
 fi
 cd "$BARLINK_DIR"
-if git diff --quiet; then
-  git apply "$ROOT/patches/barlink-platform-fixes.patch" \
-    || die "platform-fixes patch did not apply -- upstream changed; report the diff"
-else
-  echo "library already patched -- skipping"
-fi
+# Apply each patch independently and idempotently. A single combined patch
+# cannot be re-checked after a partial application, and skipping on any dirty
+# tree left installations missing later hunks (the inference_mode fix shipped
+# after the hold-BDF hunk was already applied).
+apply_patch() {
+  patch_file=$1
+  name=$(basename "$patch_file")
+  if git apply --check "$patch_file" >/dev/null 2>&1; then
+    git apply "$patch_file" || die "$name did not apply -- upstream changed; report the diff"
+    echo "applied: $name"
+  elif git apply --reverse --check "$patch_file" >/dev/null 2>&1; then
+    echo "already applied: $name"
+  else
+    die "$name did not apply and is not already applied -- upstream changed; report the diff"
+  fi
+}
+apply_patch "$ROOT/patches/barlink-platform-fixes.patch"
+apply_patch "$ROOT/patches/barlink-inference-mode.patch"
+apply_patch "$ROOT/patches/barlink-capture-gate.patch"
 
 step "dmabuf_holder module"
 make -C "$KDIR" M="$BARLINK_DIR/dmabuf_holder" modules

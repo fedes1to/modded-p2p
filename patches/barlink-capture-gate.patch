@@ -1,0 +1,104 @@
+diff --git a/src/barlink/abort_gate.py b/src/barlink/abort_gate.py
+index f70c702..64659ba 100644
+--- a/src/barlink/abort_gate.py
++++ b/src/barlink/abort_gate.py
+@@ -293,6 +293,12 @@ def poll_interval_s() -> float:
+ #: begin while one is open.
+ _capture_lock = threading.Lock()
+ _capture_depth = 0
++#: Serializes "a poll is on the device" against the capture exclusion. The
++#: capture side increments _capture_depth, then waits for this gate; a poll
++#: holds it while it reads and re-checks polling_paused() after acquiring it.
++#: Without the gate, a poll already inside poll_status_word() when the capture
++#: starts still synchronizes its private stream and invalidates the capture.
++_poll_gate = threading.Lock()
+ 
+ 
+ class _PausePolling:
+@@ -302,6 +308,11 @@ class _PausePolling:
+         global _capture_depth
+         with _capture_lock:
+             _capture_depth += 1
++        # Wait for a poll that is already reading a device. A poll that starts
++        # after the increment sees polling_paused() under the same gate and
++        # skips, so the capture begins with no poll in flight.
++        with _poll_gate:
++            pass
+         return self
+ 
+     def __exit__(self, *exc) -> None:
+@@ -426,38 +437,42 @@ def poll_status_words() -> int:
+         return 0
+     if not abort_check_enabled():
+         return 0
+-    if polling_paused():
+-        return 0
+-    tripped = 0
+-    for transport in registered():
+-        poll = getattr(transport, "poll_status_word", None)
+-        if poll is None:
+-            continue
+-        try:
+-            if poll():
+-                tripped += 1
+-        except Exception as exc:  # a watchdog must not die
+-            source = f"barlink poll_status_word({type(transport).__name__})"
+-            if is_poison_error(exc):
+-                # #867: NOT survivable, so do not pretend it was. The watchdog
+-                # still does not raise -- raising here kills the thread and
+-                # loses the record -- but it stops reading devices for the rest
+-                # of this round (every further read returns this same error and
+-                # multiplies the misattribution) and it names itself as the
+-                # origin so the crash that lands later can point back here.
+-                if record_poison(source, exc):
+-                    logger.error(
+-                        "#867 barlink-BAR1 status poll hit an UNSURVIVABLE CUDA "
+-                        "fault: %s. The context is now unusable and every later "
+-                        "CUDA call in this process will raise this same error at "
+-                        "an unrelated site -- so treat THIS as the origin, not "
+-                        "the traceback that lands next. Device polling stops "
+-                        "here. (source=%s)",
+-                        exc,
+-                        source,
+-                    )
+-                break
+-            logger.exception("barlink-BAR1 status poll failed")
++    with _poll_gate:
++        # Re-check under the gate: the capture side increments the depth and
++        # then takes this gate, so either this poll runs entirely before the
++        # capture starts, or it sees the pause here and skips.
++        if polling_paused():
++            return 0
++        tripped = 0
++        for transport in registered():
++            poll = getattr(transport, "poll_status_word", None)
++            if poll is None:
++                continue
++            try:
++                if poll():
++                    tripped += 1
++            except Exception as exc:  # a watchdog must not die
++                source = f"barlink poll_status_word({type(transport).__name__})"
++                if is_poison_error(exc):
++                    # #867: NOT survivable, so do not pretend it was. The watchdog
++                    # still does not raise -- raising here kills the thread and
++                    # loses the record -- but it stops reading devices for the rest
++                    # of this round (every further read returns this same error and
++                    # multiplies the misattribution) and it names itself as the
++                    # origin so the crash that lands later can point back here.
++                    if record_poison(source, exc):
++                        logger.error(
++                            "#867 barlink-BAR1 status poll hit an UNSURVIVABLE CUDA "
++                            "fault: %s. The context is now unusable and every later "
++                            "CUDA call in this process will raise this same error at "
++                            "an unrelated site -- so treat THIS as the origin, not "
++                            "the traceback that lands next. Device polling stops "
++                            "here. (source=%s)",
++                            exc,
++                            source,
++                        )
++                    break
++                logger.exception("barlink-BAR1 status poll failed")
+     return tripped
+ 
+ 

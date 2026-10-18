@@ -49,7 +49,20 @@ Notes:
   when the direct path is active.
 - The plugin also carries a barlink fix for `torch.inference_mode()` (the
   execution context vLLM uses): inference tensors may only be mutated inside
-  InferenceMode, so the abort-gate watchdog re-enters it.
+  InferenceMode, so the abort-gate watchdog re-enters it. `patches/barlink-inference-mode.patch`
+  is applied separately from the platform fixes, so an installation that
+  predates this hunk picks it up on the next `scripts/install.sh`.
+- The plugin enters `barlink.abort_gate.pause_polling()` around
+  `torch.cuda.graph` capture. The watchdog reads its status word on a private
+  stream and synchronizes it; CUDA forbids synchronizing any stream while a
+  capture is running, and the resulting `cudaErrorStreamCaptureUnsupported`
+  invalidates the graph. vLLM reports that as "Engine core initialization
+  failed", with the real cause buried in the worker log. The abort watchdog
+  stays enabled.
+- `patches/barlink-capture-gate.patch` closes the remaining race: the
+  exclusion now waits for a poll already on a device, and a poll that starts
+  after the pause re-checks it under the same gate. Without that gate one
+  in-flight poll can still invalidate a long startup sequence of captures.
 - Scope: tensor-parallel collectives (`all_reduce`, `all_gather`, `broadcast`,
   `reduce_scatter`, `barrier`). Pipeline-parallel `send`/`recv` is not part of
   the backend's op set.
