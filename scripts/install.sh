@@ -108,6 +108,7 @@ apply_patch "$ROOT/patches/barlink-platform-fixes.patch"
 apply_patch "$ROOT/patches/barlink-inference-mode.patch"
 apply_patch "$ROOT/patches/barlink-capture-gate.patch"
 apply_patch "$ROOT/patches/barlink-baton-marker-state.patch"
+apply_patch "$ROOT/patches/barlink-p2p-staging.patch"
 
 step "dmabuf_holder module"
 make -C "$KDIR" M="$BARLINK_DIR/dmabuf_holder" modules

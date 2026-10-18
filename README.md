@@ -90,6 +90,13 @@ sudo -E ~/venv-vllm/bin/vllm serve <your-model> \
     --disable-custom-all-reduce
 ```
 
+Pipeline parallelism works too (`--pipeline-parallel-size 2`), for the case
+where a model does not fit sharded across the cards. The stage hand-off is a
+`send`/`recv` pair, which barlink stages through pinned host memory (D2H →
+gloo → H2D) because its op set has no device point-to-point kernel. That keeps
+PP correct and uniform across transports, at the cost of host bandwidth on
+large prefill chunks; decode traffic is tiny.
+
 Each worker prints one line at startup when the direct path is active:
 
 ```
@@ -141,7 +148,11 @@ Expected: `all_reduce ...: OK` per rank and a transport state line reading
   between processes make the job hang rather than print an error.
 - Transfers below the transport's minimum size (4 KiB by default) deliberately
   use the host-staged path; larger messages are where the direct path pays.
-- Tensor parallelism is covered; pipeline-parallel `send`/`recv` is not.
+- Tensor parallelism is covered, and so is pipeline parallelism: the pp
+  stage hand-off (`send`/`recv` on CUDA tensors) is staged through pinned host
+  memory (D2H → gloo → H2D). It is correct on every transport, but it is host
+  bandwidth, so large prefill chunks across a pipeline seam cost more than a
+  collective; decode steps move only a few tens of KiB.
 - Native C++ engines (llama.cpp, Strata) have no `torch.distributed` interface
   and are out of scope for these integrations.
 

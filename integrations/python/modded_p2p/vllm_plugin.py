@@ -5,8 +5,10 @@ entry-point group at import time. Install this package (``pip install -e
 integrations/python``) and set ``MODDED_P2P_VLLM=1``; then vLLM's tensor
 parallel process group is created with barlink's backend instead of NCCL.
 
-Scope: tensor parallelism (all_reduce / broadcast). vLLM's own CUDA-IPC custom
-all-reduce auto-disables itself on rigs without peer access; keep it disabled
+Scope: tensor parallelism (all_reduce / broadcast) and pipeline parallelism
+(the stage hand-off is a send/recv pair, staged through pinned host memory by
+``patches/barlink-p2p-staging.patch``). vLLM's own CUDA-IPC custom all-reduce
+auto-disables itself on rigs without peer access; keep it disabled
 (``--disable-custom-all-reduce``) so the barlink path is the one used.
 """
 

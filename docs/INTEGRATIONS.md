@@ -72,9 +72,19 @@ Notes:
   finished `.so`. The marker now carries `waiting` or `building` and only
   `building` vetoes; it is flipped when `try_acquire`/`wait` wins the lock,
   which is the only moment the claim is true.
+- `patches/barlink-p2p-staging.patch` makes CUDA point-to-point work on the
+  backend instead of refusing it. A pipeline-parallel seam is
+  `isend`/`irecv`, not a collective, so the refusal made every PP run die at
+  warmup with `'send' is not among them and was called with a cuda tensor`.
+  The patch stages the payload through pinned host memory (D2H → gloo → H2D),
+  exactly like a staged collective: same bytes, same two planes, correct on
+  every transport. The send waits for the gloo work before returning (the host
+  buffer must outlive the transfer); pipeline loops post the matching receive
+  before the forward pass, so that wait cannot deadlock.
 - Scope: tensor-parallel collectives (`all_reduce`, `all_gather`, `broadcast`,
-  `reduce_scatter`, `barrier`). Pipeline-parallel `send`/`recv` is not part of
-  the backend's op set.
+  `reduce_scatter`, `barrier`) and pipeline-parallel point-to-point
+  (`send`/`recv`/`recv_anysource`, host-staged). `gather`, `scatter`, `reduce`
+  and the list forms of `alltoall` remain gloo-plane only for CUDA tensors.
 - The first start JIT-builds the transport extension once; set `CUDA_HOME` if
   your toolkit is not auto-detected.
 - Small test models: cap `--max-num-seqs` (for example 4) — attention backends

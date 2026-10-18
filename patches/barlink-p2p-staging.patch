@@ -1,0 +1,319 @@
+diff --git a/src/barlink/backend.py b/src/barlink/backend.py
+index 2009951..bb7960f 100644
+--- a/src/barlink/backend.py
++++ b/src/barlink/backend.py
+@@ -80,11 +80,15 @@ Honest limits
+   (torch 2.11.0+cu128): gloo rejects ``int16`` and every ``float8_*`` with
+   ``Invalid scalar type``.
+ * **Only the collectives barlink stages run on a device.** ``reduce``,
+-  ``gather``, ``scatter``, ``alltoall`` (list form), the coalesced list forms
+-  and point-to-point are gloo-plane only; on a CUDA tensor they raise
++  ``gather``, ``scatter``, ``alltoall`` (list form) and the coalesced list
++  forms are gloo-plane only; on a CUDA tensor they raise
+   :class:`UnsupportedCollective` rather than quietly running plain gloo, which
+   would change the achieved transport without changing anything the caller can
+-  see.
++  see. Point-to-point (``send`` / ``recv`` / ``recv_anysource``) is staged
++  through pinned host memory: D2H on the sender, gloo on the CPU plane, H2D on
++  the receiver. It is a byte copy, not a conversion, and it is what pipeline
++  parallelism needs -- a pipeline seam is a ``send``/``recv`` pair, not a
++  collective, so refusing it made PP unusable on barlink.
+ """
+ 
+ from __future__ import annotations
+@@ -138,6 +142,9 @@ STAGED_COLLECTIVES: tuple[str, ...] = (
+     "broadcast",
+     "alltoall_base",
+     "barrier",
++    "send",
++    "recv",
++    "recv_anysource",
+ )
+ 
+ #: Scalar types gloo will reduce. MEASURED, not read off a header: two real
+@@ -729,26 +736,67 @@ class ProcessGroupBarlink(dist.ProcessGroup):
+             ),
+         )
+ 
++    # ------------------------------------------------------------------
++    # staged point-to-point
++    #
++    # Pipeline parallelism hands one stage's activations to the next rank with
++    # ``isend``/``irecv`` on CUDA tensors. barlink has no direct p2p kernel for
++    # an arbitrary tensor, so the payload is staged exactly like a collective:
++    # D2H into pinned memory on the sender, gloo on the CPU plane, H2D on the
++    # receiver. That is a byte copy, not a conversion, and it is the same two
++    # planes the staged collectives already use.
++    #
++    # The staged send waits for the gloo work before returning. The host
++    # buffer is a local, and a fire-and-forget send would let it be freed while
++    # the transport still owns it; point-to-point callers already have to post
++    # the matching receive independently (a pipeline loop does so before the
++    # forward pass), so the wait cannot deadlock against the peer.
++    # ------------------------------------------------------------------
++
++    @staticmethod
++    def _host_buffer(tensor: torch.Tensor) -> torch.Tensor:
++        """A pinned host tensor with ``tensor``'s shape, dtype and layout."""
++        return torch.empty(
++            tensor.shape,
++            dtype=tensor.dtype,
++            layout=tensor.layout,
++            device="cpu",
++            pin_memory=True,
++        )
++
+     def send(
+         self, tensors: Sequence[torch.Tensor], dstRank: int, tag: int  # noqa: N803
+     ) -> Work:
+-        return self._gloo_plane_only(
+-            "send", tensors, lambda: self._gloo.send(list(tensors), dstRank, tag)
+-        )
++        device = self._device_of(tensors, "send")
++        if device.type == "cpu":
++            return self._gloo.send(list(tensors), dstRank, tag)
++        staged = [self._host_buffer(t) for t in tensors]
++        for host, tensor in zip(staged, tensors):
++            host.copy_(tensor)
++        self._gloo.send(staged, dstRank, tag).wait()
++        return _done(list(tensors))
+ 
+     def recv(
+         self, tensors: Sequence[torch.Tensor], srcRank: int, tag: int  # noqa: N803
+     ) -> Work:
+-        return self._gloo_plane_only(
+-            "recv", tensors, lambda: self._gloo.recv(list(tensors), srcRank, tag)
+-        )
++        device = self._device_of(tensors, "recv")
++        if device.type == "cpu":
++            return self._gloo.recv(list(tensors), srcRank, tag)
++        staged = [self._host_buffer(t) for t in tensors]
++        self._gloo.recv(staged, srcRank, tag).wait()
++        for tensor, host in zip(tensors, staged):
++            tensor.copy_(host)
++        return _done(list(tensors))
+ 
+     def recv_anysource(self, tensors: Sequence[torch.Tensor], tag: int) -> Work:
+-        return self._gloo_plane_only(
+-            "recv_anysource",
+-            tensors,
+-            lambda: self._gloo.recv_anysource(list(tensors), tag),
+-        )
++        device = self._device_of(tensors, "recv_anysource")
++        if device.type == "cpu":
++            return self._gloo.recv_anysource(list(tensors), tag)
++        staged = [self._host_buffer(t) for t in tensors]
++        self._gloo.recv_anysource(staged, tag).wait()
++        for tensor, host in zip(tensors, staged):
++            tensor.copy_(host)
++        return _done(list(tensors))
+ 
+     def monitored_barrier(
+         self,
+diff --git a/tests/test_backend_p2p_staging.py b/tests/test_backend_p2p_staging.py
+new file mode 100644
+index 0000000..404531b
+--- /dev/null
++++ b/tests/test_backend_p2p_staging.py
+@@ -0,0 +1,201 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Point-to-point on the barlink backend: staged, not refused.
++
++WHY THIS FILE EXISTS, precisely
++-------------------------------
++Pipeline parallelism does not hand a stage's activations to the next rank with
++a collective. vLLM's PP loop calls ``torch.distributed.isend`` / ``irecv`` with
++CUDA tensors, i.e. ``ProcessGroupBarlink.send`` / ``recv`` on the pp group.
++The first version of this backend refused every device point-to-point call by
++name (``UnsupportedCollective``), on the same argument that governs the other
++unstaged ops: silently routing it to gloo would change the achieved transport
++without changing anything the caller can see.
++
++That refusal is right for ``gather`` and ``scatter``, and it made every
++pipeline-parallel run on barlink die during warmup with::
++
++    barlink stages ['allreduce', ...]; 'send' is not among them and was
++    called with a cuda tensor.
++
++The fix is to stage it, not to unlock it: D2H into pinned memory, gloo on the
++CPU plane, H2D on the receiver. Same two planes as every staged collective,
++same bytes, and no change to what gloo is asked to do.
++
++WHAT THIS FILE DOES NOT PROVE
++-----------------------------
++Nothing about a real CUDA context or a real transport: the staged branch is
++driven with the device plane stubbed out and the pinned buffer replaced by a
++plain CPU tensor (``_host_buffer`` is the only piece that needs a GPU). What a
++card still has to prove is that a two-rank PP run starts and produces the same
++tokens as TP -- the hardware test for that is ``vllm_smoke.sh`` in
++modded-p2p, not this file.
++"""
++
++from __future__ import annotations
++
++import threading
++import unittest
++from unittest import mock
++
++import torch
++
++from barlink.backend import STAGED_COLLECTIVES, ProcessGroupBarlink
++
++
++class _DoneWork:
++    """The ``Work`` contract the staged path relies on: already finished."""
++
++    def wait(self) -> None:
++        return None
++
++    def is_completed(self) -> bool:
++        return True
++
++    def get_future(self):
++        raise NotImplementedError("not needed by these tests")
++
++
++class _FakeGloo:
++    """Records what the staged path hands to the CPU plane.
++
++    ``recv_payload`` is what the peer "sent": the fake writes it into the
++    staging tensors during ``recv``, which is what gloo does before ``wait``
++    returns.
++    """
++
++    def __init__(self, recv_payload: list[torch.Tensor] | None = None) -> None:
++        self.sent: list[tuple[list[torch.Tensor], int, int]] = []
++        self.received: list[tuple[list[torch.Tensor], int | None, int]] = []
++        self.recv_payload = recv_payload
++
++    def send(self, tensors, dst, tag):
++        self.sent.append((list(tensors), dst, tag))
++        return _DoneWork()
++
++    def recv(self, tensors, src, tag):
++        if self.recv_payload is not None:
++            for target, payload in zip(tensors, self.recv_payload):
++                target.copy_(payload)
++        self.received.append((list(tensors), src, tag))
++        return _DoneWork()
++
++    def recv_anysource(self, tensors, tag):
++        if self.recv_payload is not None:
++            for target, payload in zip(tensors, self.recv_payload):
++                target.copy_(payload)
++        self.received.append((list(tensors), None, tag))
++        return _DoneWork()
++
++
++def _backend(on_device: bool = True, recv_payload=None):
++    """A ProcessGroupBarlink with no store, rendezvous or transport."""
++    pg = ProcessGroupBarlink.__new__(ProcessGroupBarlink)
++    pg._barlink_size = 2
++    pg._comms = {}
++    pg._comm_lock = threading.Lock()
++    pg._gloo = _FakeGloo(recv_payload)
++    if on_device:
++        pg._device_of = lambda *a, **k: torch.device("cuda:0")
++    else:
++        pg._device_of = lambda *a, **k: torch.device("cpu")
++    return pg, pg._gloo
++
++
++def _plain_host_buffer(tensor: torch.Tensor) -> torch.Tensor:
++    """``_host_buffer`` without pinning -- these tests have no CUDA context."""
++    return torch.empty_like(tensor)
++
++
++class P2PIsAStagedCollectiveTest(unittest.TestCase):
++    def test_send_recv_and_recv_anysource_are_staged(self):
++        for name in ("send", "recv", "recv_anysource"):
++            self.assertIn(name, STAGED_COLLECTIVES)
++
++
++class StagedSendTest(unittest.TestCase):
++    def test_a_device_send_hands_host_copies_to_gloo(self):
++        pg, gloo = _backend()
++        source = torch.tensor([1.0, 2.0, 3.0])
++        with mock.patch.object(
++            ProcessGroupBarlink, "_host_buffer",
++            staticmethod(_plain_host_buffer),
++        ):
++            work = pg.send([source], dstRank=1, tag=7)
++
++        self.assertTrue(work.is_completed())
++        (staged, dst, tag), = gloo.sent
++        self.assertEqual(dst, 1)
++        self.assertEqual(tag, 7)
++        self.assertIsNot(staged[0], source, "the payload must be staged")
++        self.assertEqual(staged[0].device.type, "cpu")
++        self.assertTrue(torch.equal(staged[0], source))
++
++    def test_the_source_tensor_is_not_modified(self):
++        pg, _ = _backend()
++        source = torch.tensor([4.0, 5.0])
++        with mock.patch.object(
++            ProcessGroupBarlink, "_host_buffer",
++            staticmethod(_plain_host_buffer),
++        ):
++            pg.send([source], dstRank=1, tag=1)
++        self.assertTrue(torch.equal(source, torch.tensor([4.0, 5.0])))
++
++
++class StagedRecvTest(unittest.TestCase):
++    def test_a_device_recv_copies_the_host_payload_back(self):
++        pg, gloo = _backend(recv_payload=[torch.tensor([9.0, 8.0, 7.0])])
++        target = torch.zeros(3)
++        with mock.patch.object(
++            ProcessGroupBarlink, "_host_buffer",
++            staticmethod(_plain_host_buffer),
++        ):
++            work = pg.recv([target], srcRank=0, tag=3)
++
++        self.assertTrue(work.is_completed())
++        self.assertTrue(torch.equal(target, torch.tensor([9.0, 8.0, 7.0])))
++        self.assertEqual(gloo.received[0][1], 0)
++        self.assertEqual(gloo.received[0][2], 3)
++
++    def test_recv_anysource_copies_the_host_payload_back(self):
++        pg, gloo = _backend(recv_payload=[torch.tensor([6.0, 5.0])])
++        target = torch.zeros(2)
++        with mock.patch.object(
++            ProcessGroupBarlink, "_host_buffer",
++            staticmethod(_plain_host_buffer),
++        ):
++            work = pg.recv_anysource([target], tag=11)
++
++        self.assertTrue(work.is_completed())
++        self.assertTrue(torch.equal(target, torch.tensor([6.0, 5.0])))
++        self.assertIsNone(gloo.received[0][1])
++        self.assertEqual(gloo.received[0][2], 11)
++
++
++class CpuP2PStaysOnGlooTest(unittest.TestCase):
++    def test_a_cpu_send_is_not_staged(self):
++        pg, gloo = _backend(on_device=False)
++        source = torch.tensor([1.0, 2.0])
++        with mock.patch.object(
++            ProcessGroupBarlink, "_host_buffer",
++            staticmethod(lambda t: self.fail("CPU tensors must not be staged")),
++        ):
++            pg.send([source], dstRank=1, tag=2)
++        (staged, dst, tag), = gloo.sent
++        self.assertIs(staged[0], source)
++        self.assertEqual((dst, tag), (1, 2))
++
++    def test_a_cpu_recv_is_not_staged(self):
++        pg, gloo = _backend(on_device=False)
++        target = torch.zeros(2)
++        with mock.patch.object(
++            ProcessGroupBarlink, "_host_buffer",
++            staticmethod(lambda t: self.fail("CPU tensors must not be staged")),
++        ):
++            pg.recv([target], srcRank=0, tag=5)
++        (staged, src, tag), = gloo.received
++        self.assertIs(staged[0], target)
++        self.assertEqual((src, tag), (0, 5))
++
++
++if __name__ == "__main__":
++    unittest.main()
