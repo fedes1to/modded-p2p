@@ -74,7 +74,12 @@ Notes:
   which is the only moment the claim is true.
 - Scope: tensor-parallel collectives (`all_reduce`, `all_gather`, `broadcast`,
   `reduce_scatter`, `barrier`). Pipeline-parallel `send`/`recv` is not part of
-  the backend's op set.
+  the backend's op set, and it is deliberately not emulated: barlink has no
+  device point-to-point kernel, and staging it through the host plane measured
+  1.5-1.9x slower than NCCL at every size from 16 KiB to 64 MiB on the
+  reference pair. Run pipeline-parallel profiles with NCCL instead -- leave
+  `MODDED_P2P_VLLM` unset (or do not load the plugin) for those runs; the
+  process group is then the stock NCCL one.
 - The first start JIT-builds the transport extension once; set `CUDA_HOME` if
   your toolkit is not auto-detected.
 - Small test models: cap `--max-num-seqs` (for example 4) — attention backends

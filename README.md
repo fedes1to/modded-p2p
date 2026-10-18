@@ -142,6 +142,10 @@ Expected: `all_reduce ...: OK` per rank and a transport state line reading
 - Transfers below the transport's minimum size (4 KiB by default) deliberately
   use the host-staged path; larger messages are where the direct path pays.
 - Tensor parallelism is covered; pipeline-parallel `send`/`recv` is not.
+  barlink has no device p2p kernel, and staging the hand-off through the host
+  plane measured 1.5-1.9x slower than NCCL at every size from 16 KiB to
+  64 MiB. For PP profiles, leave `MODDED_P2P_VLLM` unset and let the stock
+  NCCL group carry the run.
 - Native C++ engines (llama.cpp, Strata) have no `torch.distributed` interface
   and are out of scope for these integrations.
 
