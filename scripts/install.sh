@@ -3,6 +3,8 @@
 #
 #   sudo bash scripts/install.sh                 # build + install + activate now
 #   sudo bash scripts/install.sh --with-torch    # ... plus the optional Python checks
+#   sudo bash scripts/install.sh --with-gpu-unlock  # force the optional GA102/GA104 unlock
+#   sudo bash scripts/install.sh --no-gpu-unlock    # never install the unlock
 #   sudo bash scripts/install.sh --no-activate   # install for the next boot only
 #
 # What it does:
@@ -13,6 +15,8 @@
 #      packaged module, so every boot from now on loads the patched one)
 #   3. writes the load keys and runtime environment
 #   4. swaps the running driver now (screen freezes for a few seconds)
+#   5. installs Zagitta/gpu-unlock when a GA102/GA104 card is present (or when
+#      forced); on other cards it is skipped unless --with-gpu-unlock is given
 #
 # Undo everything with:  sudo bash scripts/revert.sh
 set -euo pipefail
@@ -29,6 +33,7 @@ KVER="$(uname -r)"
 KDIR="/lib/modules/$KVER/build"
 OVR="/lib/modules/$KVER/updates/barlink-p2p"
 WITH_TORCH=0
+WITH_GPU_UNLOCK=auto
 ACTIVATE=1
 UPSTREAM_DRIVER="https://github.com/NVIDIA/open-gpu-kernel-modules"
 UPSTREAM_BARLINK="https://github.com/efschu/barlink-pcie"
@@ -36,9 +41,11 @@ UPSTREAM_BARLINK="https://github.com/efschu/barlink-pcie"
 for arg in "$@"; do
   case "$arg" in
     --with-torch)    WITH_TORCH=1 ;;
+    --with-gpu-unlock) WITH_GPU_UNLOCK=1 ;;
+    --no-gpu-unlock)   WITH_GPU_UNLOCK=0 ;;
     --no-activate)   ACTIVATE=0 ;;
     --driver-tag=*)  DRIVER_TAG="${arg#*=}" ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -53,6 +60,24 @@ for c in git patch make gcc python3 depmod insmod modprobe; do
 done
 [ -e "$KDIR" ] || die "kernel headers missing at $KDIR (install your distro's linux-headers package)"
 echo "kernel $(uname -r) | compiler $(gcc -dumpversion)"
+
+# gpu-unlock is for GA102/GA104 only. Enable it when such a card is present;
+# other cards need an explicit --with-gpu-unlock. --check only reads the
+# pinned PCI ID list from the upstream source.
+if [ "$WITH_GPU_UNLOCK" = auto ]; then
+  if bash "$ROOT/scripts/install-gpu-unlock.sh" --check >/dev/null 2>&1; then
+    WITH_GPU_UNLOCK=1
+    echo "GA102/GA104 card detected: gpu-unlock will be installed"
+  else
+    rc=$?
+    WITH_GPU_UNLOCK=0
+    if [ "$rc" = 3 ]; then
+      echo "no GA102/GA104 card: gpu-unlock skipped (force with --with-gpu-unlock)"
+    else
+      warn "gpu-unlock precheck failed (rc=$rc); skipped (force with --with-gpu-unlock)"
+    fi
+  fi
+fi
 
 mkdir -p "$BASE" "$BUILD"
 DRIVER_DIR="$BUILD/driver-$DRIVER_TAG"
@@ -265,6 +290,15 @@ if [ "$ACTIVATE" = 1 ]; then
   done
 fi
 
+if [ "$WITH_GPU_UNLOCK" = 1 ]; then
+  step "gpu-unlock (optional GA102/GA104 pre-driver unlock)"
+  if bash "$ROOT/scripts/install-gpu-unlock.sh" ${GPU_UNLOCK_ARGS:-}; then
+    GPU_UNLOCK_INSTALLED=1
+  else
+    warn "gpu-unlock installation failed; the barlink-p2p installation above is unaffected"
+  fi
+fi
+
 step "installed"
 cat <<EOF
 Persistent: every boot now loads the patched module from
@@ -275,3 +309,10 @@ Revert to stock: sudo bash $ROOT/scripts/revert.sh   (a reboot also does it)
 After a kernel  upgrade: re-run this installer for the new kernel; until then
 the machine boots the stock driver (safe).
 EOF
+if [ "${GPU_UNLOCK_INSTALLED:-0}" = 1 ]; then
+  cat <<'EOF'
+gpu-unlock: installed; it runs from the next boot (cold boot is upstream's
+supported path; kernels >= 6.16 also worked after a warm reboot here).
+  check: dmesg | grep gpu_unlock   (or journalctl -k -b with journald)
+EOF
+fi

@@ -8,6 +8,11 @@ Built on [**barlink-pcie**](https://github.com/efschu/barlink-pcie) by
 port of their driver patch to a current NVIDIA open-kernel-modules tag, two
 platform fixes, and a persistent installer.
 
+The optional GA102/GA104 pre-driver unlock is
+[**gpu-unlock**](https://github.com/Zagitta/gpu-unlock) by **Zagitta** — all
+credit for the module and the V67/PLM sequence goes there. This repository adds
+a pinned, repeatable installer for it.
+
 ## What it changes
 
 Consumer cards normally cannot address each other's memory: peer access is
@@ -37,6 +42,7 @@ under: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 - systemd, OpenRC or dinit
 - Root (to load kernel modules)
 - ~2 GB disk
+- For the optional GA102/GA104 unlock: `python3` ≥ 3.14 (firmware generator) and network access to the pinned inputs
 
 The installer pins the NVIDIA source tag it was written against; see
 [docs/DETAILS.md](docs/DETAILS.md).
@@ -60,6 +66,11 @@ sudo bash scripts/revert.sh
 ```
 
 A reboot also returns to the stock driver.
+
+On GA102/GA104 machines the installer also sets up the optional
+[compute unlock](docs/GPU-UNLOCK.md) described below. `--no-gpu-unlock` opts
+out; `--with-gpu-unlock` forces it on a machine where auto-detection is not
+wanted.
 
 ## vLLM and sglang
 
@@ -148,9 +159,30 @@ Expected: `all_reduce ...: OK` per rank and a transport state line reading
 
 Details and limits: [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md).
 
+## GPU unlock (GA102/GA104, optional)
+
+[gpu-unlock](https://github.com/Zagitta/gpu-unlock) runs from the initramfs
+before the driver binds and lifts the SM issue-rate dividers (`SS0`/`SS1`), the
+consumer/CMP cap on tensor and arithmetic throughput. It does not touch clocks,
+memory bandwidth, BAR1 or the P2P path, and it never writes the vBIOS.
+
+```bash
+sudo bash scripts/install-gpu-unlock.sh          # auto-detects the cards
+sudo bash scripts/install.sh --with-gpu-unlock   # or as part of the main install
+```
+
+It is enabled automatically by `install.sh` when a GA102/GA104 card is present.
+It runs from the next boot; upstream's supported path is a cold boot, though
+kernels ≥ 6.16 also applied it after a warm reboot here. Verify with
+`dmesg | grep gpu_unlock` (root) or `journalctl -k -b` with journald.
+
+Scope, the 3080-20GB-versus-3090 caveat, what the selectors really govern, and
+recovery: [docs/GPU-UNLOCK.md](docs/GPU-UNLOCK.md).
+
 ## Docs
 
 - [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) — framework integration and limits
+- [docs/GPU-UNLOCK.md](docs/GPU-UNLOCK.md) — GA102/GA104 compute unlock (scope, selectors, cold boot)
 - [docs/DETAILS.md](docs/DETAILS.md) — how the patch works, troubleshooting, FAQ
 - [docs/PERFORMANCE.md](docs/PERFORMANCE.md) — measurements, conditions
 - [LICENSE-NOTES.md](LICENSE-NOTES.md) — licenses

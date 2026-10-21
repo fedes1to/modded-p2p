@@ -84,6 +84,7 @@ code runs).
 | want stock now | `scripts/revert.sh` (or reboot) |
 | display black after load | `scripts/revert.sh` or start your DM |
 | verify a module is the patched one | `strings <ko> \| grep -c BARLINK_PCIE` → 37; `cat /sys/module/nvidia/srcversion` must equal `modinfo <ko> \| grep srcversion` |
+| `gpu_unlock` logs `unlock failed` / `card already initialised since power on` | the card was not cold (warm reboot) or a driver used it this power cycle | power the machine off and on; remove `gpu_unlock.targets=` to disable |
 
 ## What each script does
 
@@ -91,7 +92,10 @@ code runs).
 |---|---|---|
 | `scripts/install.sh` | root | clones NVIDIA's module source at the pinned tag, applies `patches/BARLINK_PCIE-615.78.08.patch`, builds it; clones barlink-pcie, applies `patches/barlink-platform-fixes.patch`, `patches/barlink-inference-mode.patch`, `patches/barlink-capture-gate.patch` and `patches/barlink-baton-marker-state.patch`, builds `dmabuf_holder`; installs the modules as a persistent override, writes the keys, activates now. Idempotent — re-run after a kernel upgrade |
 | `scripts/verify.sh` | root | compiles and runs the byte-proof probe (both directions, `bad_bytes` must be 0); checks the loaded module, keys, holder, and optionally runs barlink's own `preflight` |
-| `scripts/revert.sh` | root | removes the override and all config, returns to the stock driver |
+| `scripts/revert.sh` | root | removes the override and all config, returns to the stock driver; also removes the optional gpu-unlock component when present |
+| `scripts/install-gpu-unlock.sh` | root (`--check` and `--dry-run` work unprivileged) | optional GA102/GA104 unlock: clones the pinned upstream commit, verifies and generates the 610.43.03 firmware, builds `gpu_unlock.ko`, installs it with its initramfs drop-in and adds the cmdline opt-in |
+| `scripts/gpu-unlock-cmdline.sh` | root | add/remove/show `gpu_unlock.targets=` on systemd-boot entries, the embedded UKI cmdline, GRUB, limine or rEFInd |
+| `scripts/revert-gpu-unlock.sh` | root | removes the cmdline option, module, firmware, licenses and drop-in, and rebuilds the image |
 
 Files written by `install.sh`:
 
@@ -102,6 +106,16 @@ Files written by `install.sh`:
 | `/etc/dinit.d/barlink-holder` + `boot.d` link — or `/etc/modules-load.d/barlink-p2p.conf` — or `/etc/conf.d/modules` | loads `dmabuf_holder` at boot, per init system |
 | `/etc/profile.d/barlink-p2p.sh`, `/etc/barlink-p2p.hold-bdf` | runtime environment for the barlink library (`BARLINK_BAR1_NV_SOURCE`, `BARLINK_BAR1_HOLD_BDF`, `CUDA_HOME`) |
 | `/opt/modded-p2p/build/` | the source trees and built modules |
+
+Files written by `install-gpu-unlock.sh`:
+
+| Path | Purpose |
+|---|---|
+| `/lib/modules/<kernel>/updates/gpu-unlock/gpu_unlock.ko` | the unlock module, loaded from the initramfs before `nvidia` |
+| `/usr/lib/firmware/gpu-unlock/610.43.03/*.bin` | booter, GSP and V67 images generated from the pinned, checksummed 610.43.03 inputs |
+| `/etc/mkinitcpio.conf.d/zz-gpu-unlock.conf` — or the dracut / initramfs-tools drop-in | puts `gpu_unlock` and its firmware in the boot image, before `nvidia` |
+| `/etc/cmdline.d/zz-gpu-unlock.conf`, `/etc/kernel/cmdline`, `/etc/default/grub` or `/etc/default/limine` | the `gpu_unlock.targets=` opt-in, on the mechanism in use |
+| `/opt/modded-p2p/build/gpu-unlock`, `/opt/modded-p2p/gpu-unlock-cache/` | pinned source tree, inputs and generated assets |
 
 The patched stack is not related to the **userspace** driver package: if an
 NVIDIA `.run` installer ever overwrote system libraries (libglvnd/`nvidia-utils`
@@ -139,6 +153,9 @@ machine does not run.
   that `revert.sh` (or a reboot) removes.
 - The only real risk of an out-of-tree kernel module is a kernel crash while
   it is loaded. Keep a TTY reachable; recovery is `revert.sh` or reboot.
+- The optional gpu-unlock firmware is generated at install time from NVIDIA
+  610.43.03 inputs whose SHA-256 is pinned; neither that firmware nor the
+  upstream module source is redistributed here.
 
 ## FAQ
 
@@ -171,6 +188,8 @@ patches/
   BARLINK_PCIE-615.78.08.patch     driver patch (barlink-pcie's, ported to 615.78.08)
   barlink-platform-fixes.patch     two probe-flag fixes + BARLINK_BAR1_HOLD_BDF support
   barlink-baton-marker-state.patch JIT build lock: a queued waiter is not a builder
+  gpu-unlock-kernel-power-state.patch  pre-6.16 PCI D0 sync for the unlock
 scripts/ install.sh verify.sh revert.sh
-docs/    DETAILS.md PERFORMANCE.md
+         install-gpu-unlock.sh gpu-unlock-cmdline.sh revert-gpu-unlock.sh
+docs/    DETAILS.md PERFORMANCE.md GPU-UNLOCK.md
 ```

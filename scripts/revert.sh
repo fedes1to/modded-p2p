@@ -8,6 +8,9 @@ set -euo pipefail
 
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash $0" >&2; exit 1; }
 
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+
 BASE="${BARLINK_BASE:-/opt/modded-p2p}"
 KVER="$(uname -r)"
 OVR="/lib/modules/$KVER/updates/barlink-p2p"
@@ -67,6 +70,12 @@ rm -f /etc/modprobe.d/barlink-p2p.conf \
 [ -f /etc/conf.d/modules ] && sed -i '/dmabuf_holder/d' /etc/conf.d/modules 2>/dev/null || true
 [ -f /etc/modules ] && sed -i '/^dmabuf_holder$/d' /etc/modules 2>/dev/null || true
 depmod -a "$KVER"
+
+if [ -x "$ROOT/scripts/revert-gpu-unlock.sh" ] &&
+   { [ -e /usr/lib/firmware/gpu-unlock ] || compgen -G "/lib/modules/*/updates/gpu-unlock" >/dev/null; }; then
+  step "removing the optional gpu-unlock component"
+  "$ROOT/scripts/revert-gpu-unlock.sh" || warn "gpu-unlock cleanup reported a problem"
+fi
 
 step "restoring the stock driver"
 RESOLVED="$(modinfo -n nvidia 2>/dev/null || true)"

@@ -1,0 +1,16 @@
+--- a/kernel/gpu_unlock/unlock_610.c
++++ b/kernel/gpu_unlock/unlock_610.c
+@@ -796,6 +796,13 @@
+ 	unsigned int i;
+ 	int ret;
+ 
++	/* Kernels before 6.16 leave a device the firmware never POSTed at
++	 * PCI_UNKNOWN until a driver powers it up; the card is physically in
++	 * D0 on a fresh cold boot. Sync the bookkeeping; the PMCSR read below
++	 * still verifies the hardware state.
++	 */
++	if (work->pdev->current_state != PCI_D0)
++		pci_set_power_state(work->pdev, PCI_D0);
+ 	dev_info(&work->pdev->dev, "claim: power=%d pm_cap=%#x flags=%#x\n",
+ 		work->pdev->current_state, work->pdev->pm_cap, work->pdev->dev_flags);
+ 	if (work->pdev->current_state != PCI_D0 ||
