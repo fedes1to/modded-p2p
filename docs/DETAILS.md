@@ -90,7 +90,8 @@ code runs).
 
 | Script | Run as | Effect |
 |---|---|---|
-| `scripts/install.sh` | root | clones NVIDIA's module source at the pinned tag, applies `patches/BARLINK_PCIE-615.78.08.patch`, builds it; clones barlink-pcie, applies `patches/barlink-platform-fixes.patch`, `patches/barlink-inference-mode.patch`, `patches/barlink-capture-gate.patch` and `patches/barlink-baton-marker-state.patch`, builds `dmabuf_holder`; installs the modules as a persistent override, writes the keys, activates now. Idempotent — re-run after a kernel upgrade |
+| `scripts/install.sh` | root | detects the GPUs (`nvidia-smi`) and selects the components: gpu-unlock on GA102/GA104; modded-p2p on modded cards (2080 Ti 22 GB, 3080 20 GB, 4080 32 GB, 4090 48 GB) or on uneven rigs after confirmation (uniform stock rigs need `--with-modded-p2p`); offers the vLLM custom all-reduce patch on an even GPU count. For modded-p2p it clones NVIDIA's module source at the pinned tag, applies `patches/BARLINK_PCIE-615.78.08.patch`, builds it; clones barlink-pcie, applies the four `patches/barlink-*.patch`, builds `dmabuf_holder`, installs the modules as a persistent override, writes the keys, and activates now. Idempotent — re-run after a kernel upgrade |
+| `scripts/patch-venvs.sh` | the venv's owner (re-runs itself as `$SUDO_USER` when started with sudo) | applies the four `patches/barlink-*.patch` to the barlink-pcie each venv imports, and `patches/vllm-custom-allreduce-p2p-<version>.patch` to the vLLM venv; idempotent, `--check` reports without writing |
 | `scripts/verify.sh` | root | compiles and runs the byte-proof probe (both directions, `bad_bytes` must be 0); checks the loaded module, keys, holder, and optionally runs barlink's own `preflight` |
 | `scripts/revert.sh` | root | removes the override and all config, returns to the stock driver; also removes the optional gpu-unlock component when present |
 | `scripts/install-gpu-unlock.sh` | root (`--check` and `--dry-run` work unprivileged) | optional GA102/GA104 unlock: clones the pinned upstream commit, verifies and generates the 610.43.03 firmware, builds `gpu_unlock.ko`, installs it with its initramfs drop-in and adds the cmdline opt-in |
@@ -105,7 +106,7 @@ Files written by `install.sh`:
 | `/etc/modprobe.d/barlink-p2p.conf` | `NVreg_RegistryDwords="BarlinkPeerBar1=1;RMPcieP2PType=1"` (unknown keys are ignored by stock modules, so a kernel update cannot break the boot) |
 | `/etc/dinit.d/barlink-holder` + `boot.d` link — or `/etc/modules-load.d/barlink-p2p.conf` — or `/etc/conf.d/modules` | loads `dmabuf_holder` at boot, per init system |
 | `/etc/profile.d/barlink-p2p.sh`, `/etc/barlink-p2p.hold-bdf` | runtime environment for the barlink library (`BARLINK_BAR1_NV_SOURCE`, `BARLINK_BAR1_HOLD_BDF`, `CUDA_HOME`) |
-| `/opt/modded-p2p/build/` | the source trees and built modules |
+| `/opt/nvidia-gpu-patches/build/` | the source trees and built modules |
 
 Files written by `install-gpu-unlock.sh`:
 
@@ -115,7 +116,7 @@ Files written by `install-gpu-unlock.sh`:
 | `/usr/lib/firmware/gpu-unlock/610.43.03/*.bin` | booter, GSP and V67 images generated from the pinned, checksummed 610.43.03 inputs |
 | `/etc/mkinitcpio.conf.d/zz-gpu-unlock.conf` — or the dracut / initramfs-tools drop-in | puts `gpu_unlock` and its firmware in the boot image, before `nvidia` |
 | `/etc/cmdline.d/zz-gpu-unlock.conf`, `/etc/kernel/cmdline`, `/etc/default/grub` or `/etc/default/limine` | the `gpu_unlock.targets=` opt-in, on the mechanism in use |
-| `/opt/modded-p2p/build/gpu-unlock`, `/opt/modded-p2p/gpu-unlock-cache/` | pinned source tree, inputs and generated assets |
+| `/opt/nvidia-gpu-patches/build/gpu-unlock`, `/opt/nvidia-gpu-patches/gpu-unlock-cache/` | pinned source tree, inputs and generated assets |
 
 The patched stack is not related to the **userspace** driver package: if an
 NVIDIA `.run` installer ever overwrote system libraries (libglvnd/`nvidia-utils`
@@ -142,7 +143,7 @@ machine does not run.
 | holder attach fails with `ENOTSUPP`, dmesg `NVRM: attaching GPU is not supported` | 615-class drivers refuse FRAMEBUFFER dma-bufs attached as a **GPU** | attach as a non-GPU busmaster — the installer auto-detects a NIC or NVMe controller and exports `BARLINK_BAR1_HOLD_BDF` |
 | Export fails with `NV_ERR_INVALID_LOCK_STATE` | static BAR1 forced on a small-BAR card | do **not** pass `RMStaticBar1LocalForce` — `install.sh` doesn't |
 | `mmap(resource1_wc): EINVAL` | kernel with `CONFIG_IO_STRICT_DEVMEM=y`: a driver-claimed BAR cannot be sysfs-mmapped. The peer's BAR1 is unclaimed, so it works | none needed; do not mmap BAR0 |
-| marker count ≠ 37 after build | wrong tag or a partially applied patch | `git -C /opt/modded-p2p/build/driver-* diff --stat` → should be 21 files, +1805/−57 |
+| marker count ≠ 37 after build | wrong tag or a partially applied patch | `git -C /opt/nvidia-gpu-patches/build/driver-* diff --stat` → should be 21 files, +1805/−57 |
 | screen stays black | display manager was stopped and not restarted | start your DM; or TTY (Ctrl-Alt-F3) → `scripts/revert.sh` → reboot |
 
 ## Safety
@@ -187,9 +188,12 @@ barlink's own
 patches/
   BARLINK_PCIE-615.78.08.patch     driver patch (barlink-pcie's, ported to 615.78.08)
   barlink-platform-fixes.patch     two probe-flag fixes + BARLINK_BAR1_HOLD_BDF support
+  barlink-capture-gate.patch       watchdog poll exclusion around CUDA-graph capture
+  barlink-inference-mode.patch     abort-gate watchdog re-enters InferenceMode
   barlink-baton-marker-state.patch JIT build lock: a queued waiter is not a builder
   gpu-unlock-kernel-power-state.patch  pre-6.16 PCI D0 sync for the unlock
-scripts/ install.sh verify.sh revert.sh
+  vllm-custom-allreduce-p2p-0.31.0.patch  vLLM: enable the P2P custom all-reduce on >2 PCIe GPUs (0.31.0)
+scripts/ install.sh patch-venvs.sh verify.sh revert.sh
          install-gpu-unlock.sh gpu-unlock-cmdline.sh revert-gpu-unlock.sh
 docs/    DETAILS.md PERFORMANCE.md GPU-UNLOCK.md
 ```

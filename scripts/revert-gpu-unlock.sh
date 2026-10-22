@@ -7,14 +7,14 @@
 #
 #   sudo bash scripts/revert-gpu-unlock.sh
 #
-# The build tree under /opt/modded-p2p is left in place (reinstall from it).
+# The build tree under /opt/nvidia-gpu-patches is left in place (reinstall from it).
 set -euo pipefail
 
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash $0" >&2; exit 1; }
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-BASE="${BARLINK_BASE:-/opt/modded-p2p}"
+BASE="${BARLINK_BASE:-/opt/nvidia-gpu-patches}"
 KVER="$(uname -r)"
 FW="/usr/lib/firmware/gpu-unlock"
 

@@ -1,7 +1,7 @@
 """Two-rank correctness test for the barlink torch backend (the seam vLLM and
 sglang use). Run with torchrun:
 
-    CUDA_HOME=/opt/cuda BARLINK_BAR1_NV_SOURCE=/opt/modded-p2p/build/driver-615.78.08 \
+    CUDA_HOME=/opt/cuda BARLINK_BAR1_NV_SOURCE=/opt/nvidia-gpu-patches/build/driver-615.78.08 \
     BARLINK_BAR1_HOLD_BDF=$(cat /etc/barlink-p2p.hold-bdf) \
     torchrun --nproc_per_node=2 tests/test_backend_allreduce.py --backend barlink
 

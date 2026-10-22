@@ -38,7 +38,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
-BASE="${BARLINK_BASE:-/opt/modded-p2p}"
+BASE="${BARLINK_BASE:-/opt/nvidia-gpu-patches}"
 BUILD="$BASE/build"
 SRC="$BUILD/gpu-unlock"
 CACHE="$BASE/gpu-unlock-cache"

@@ -118,7 +118,7 @@ firmware, builds `gpu_unlock.ko` against the running kernel and installs:
 | `/lib/modules/<kernel>/updates/gpu-unlock/gpu_unlock.ko` | module, loaded from the initramfs |
 | `/usr/lib/firmware/gpu-unlock/610.43.03/*.bin` | booter, GSP and V67 images |
 | `/etc/mkinitcpio.conf.d/zz-gpu-unlock.conf` (or the dracut / initramfs-tools drop-in) | puts the module and its firmware in the image, before `nvidia` |
-| `/opt/modded-p2p/build/gpu-unlock`, `/opt/modded-p2p/gpu-unlock-cache` | source tree, pinned inputs and generated assets |
+| `/opt/nvidia-gpu-patches/build/gpu-unlock`, `/opt/nvidia-gpu-patches/gpu-unlock-cache` | source tree, pinned inputs and generated assets |
 
 Kernels before 6.16 leave a card the firmware never POSTed at `PCI_UNKNOWN`, so
 upstream's D0 gate rejects it; the installer applies

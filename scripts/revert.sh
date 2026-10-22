@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Undo modded-p2p completely: remove the persistent override and all config,
+# Undo nvidia-gpu-patches completely: remove the persistent override and all config,
 # return to the stock driver. Works with systemd, OpenRC and dinit.
 # Safe to run from a TTY if a boot went wrong.
 #
@@ -11,7 +11,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
-BASE="${BARLINK_BASE:-/opt/modded-p2p}"
+BASE="${BARLINK_BASE:-/opt/nvidia-gpu-patches}"
 KVER="$(uname -r)"
 OVR="/lib/modules/$KVER/updates/barlink-p2p"
 
@@ -100,6 +100,6 @@ for s in $stopped; do
 done
 
 step "done"
-echo "modded-p2p removed. Reboot for a completely clean state."
+echo "nvidia-gpu-patches removed. Reboot for a completely clean state."
 echo "The build tree at $BASE was left in place; delete it manually if you want:"
 echo "  rm -rf $BASE"

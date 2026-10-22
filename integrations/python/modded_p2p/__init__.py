@@ -1,4 +1,4 @@
-"""modded-p2p framework integrations.
+"""nvidia-gpu-patches framework integrations.
 
 Shared seam: barlink-pcie ships a real ``torch.distributed`` backend
 (``barlink.register_backend()`` -> ``init_process_group(backend="barlink")``,
@@ -13,7 +13,7 @@ barlink backend name instead of ``nccl`` for its tensor-parallel group.
 or let a framework plugin do it (vLLM entry point, sglang import hook).
 
 Requirements for the BAR1 plane (inherited from barlink-pcie):
-  * the persistent driver from modded-p2p's install.sh (BarlinkPeerBar1=1),
+  * the persistent driver from the installer (BarlinkPeerBar1=1),
   * ``BARLINK_BAR1_NV_SOURCE`` / ``BARLINK_BAR1_HOLD_BDF`` / ``CUDA_HOME``
     (installed into /etc/profile.d by the installer),
   * CAP_SYS_ADMIN in the worker processes (driver checks osIsAdministrator()),

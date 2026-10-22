@@ -26,6 +26,7 @@ environment and install the shim plus barlink into that environment.
 python3 -m venv ~/venv-vllm
 ~/venv-vllm/bin/pip install vllm
 ~/venv-vllm/bin/pip install -e /path/to/barlink-pcie -e integrations/python
+sudo bash scripts/patch-venvs.sh ~/venv-vllm   # barlink patches + vLLM custom all-reduce
 
 . /etc/profile.d/barlink-p2p.sh   # BARLINK_* and CUDA_HOME, written by install.sh
 export MODDED_P2P_VLLM=1
@@ -45,6 +46,18 @@ Notes:
   communicator's `all_reduce` with vLLM's own documented fallback
   (`clone` + `torch.distributed.all_reduce`), so the collective lands on the
   barlink backend.
+- On more than two PCIe-only GPUs (no NVLink), vLLM also disables its own
+  P2P custom all-reduce — 0.31.0 gates it in the constructor (`world_size > 2
+  and not fully_connected`, plus the supported-world-size list) and in
+  `should_custom_ar` (`world_size == 2 or self.fully_connected`). With this
+  project's P2P driver,
+  `patches/vllm-custom-allreduce-p2p-0.31.0.patch` re-enables the full-mesh
+  kernel path for 4/6/8-GPU groups (vLLM 0.31.0; port the single hunk for
+  other releases), with the per-pair P2P test as the real gate. The kernel
+  supports world sizes 2/4/6/8 only, so a 3-GPU group cannot use it. This
+  only matters for vLLM runs without the plugin — with the plugin active,
+  `CudaCommunicator.all_reduce` is overridden and the custom all-reduce is
+  never used.
 - Each worker prints `modded_p2p: process group created, resolved backend=barlink`
   when the direct path is active.
 - The plugin also carries a barlink fix for `torch.inference_mode()` (the
@@ -106,6 +119,7 @@ wheels for your interpreter do not exist, pip will try to build them and fail
 python3 -m venv ~/venv-sglang
 ~/venv-sglang/bin/pip install sglang
 ~/venv-sglang/bin/pip install -e /path/to/barlink-pcie -e integrations/python
+sudo bash scripts/patch-venvs.sh ~/venv-sglang  # barlink patches
 
 . /etc/profile.d/barlink-p2p.sh
 export MODDED_P2P_SGLANG=1

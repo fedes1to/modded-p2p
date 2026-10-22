@@ -1,4 +1,4 @@
-"""Launcher that applies the modded-p2p backend mapping before sglang starts.
+"""Launcher that applies the nvidia-gpu-patches backend mapping before sglang starts.
 
     MODDED_P2P_SGLANG=1 BARLINK_TRANSPORT=bar1 \
       python -m modded_p2p.sglang_launch --model-path <model> --tp 2 ...

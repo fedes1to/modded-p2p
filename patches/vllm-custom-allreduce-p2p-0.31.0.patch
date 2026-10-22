@@ -1,0 +1,25 @@
+--- a/vllm/distributed/device_communicators/custom_all_reduce.py
++++ b/vllm/distributed/device_communicators/custom_all_reduce.py
+@@ -262,12 +262,17 @@
+             assert current_platform.is_cuda_alike()
+             fully_connected = current_platform.is_fully_connected(physical_device_ids)
+         if same_node and world_size > 2 and not fully_connected:
+-            logger.warning(
+-                "Custom allreduce is disabled because it's not supported on"
+-                " more than two PCIe-only GPUs. To silence this warning, "
+-                "specify disable_custom_all_reduce=True explicitly."
++            # PATCHED (modded-p2p): with a P2P-enabled (patched) NVIDIA
++            # driver, consumer GPUs have full pairwise PCIe BAR1 P2P
++            # access. Don't disable custom allreduce just because NVLink
++            # is absent: use the full-mesh kernel path (requires all-pairs
++            # P2P access) and let the real per-pair P2P test below
++            # (_can_p2p) be the gate.
++            logger.info(
++                "Custom allreduce: no NVLink detected; using PCIe BAR1 P2P "
++                "full-mesh path (requires P2P-enabled driver)."
+             )
+-            return
++            fully_connected = True
+         # test P2P capability, this checks software/cudaruntime support
+         # this is expensive to compute at the first time
+         # then we cache the result

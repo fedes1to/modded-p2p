@@ -1,4 +1,4 @@
-# modded-p2p
+# nvidia-gpu-patches
 
 GPU↔GPU direct transfers (P2P) on consumer NVIDIA cards — **no ReBAR, no
 firmware flashing, no proprietary blobs**. Patches and scripts only.
@@ -6,7 +6,9 @@ firmware flashing, no proprietary blobs**. Patches and scripts only.
 Built on [**barlink-pcie**](https://github.com/efschu/barlink-pcie) by
 **efschu** — all credit for the mechanism goes there. This repository adds a
 port of their driver patch to a current NVIDIA open-kernel-modules tag, two
-platform fixes, and a persistent installer.
+platform fixes, and a persistent installer. It also carries the framework-side
+patches (vLLM/sglang venvs, plus a vLLM P2P custom all-reduce port) and picks
+the components that apply to the cards it finds.
 
 The optional GA102/GA104 pre-driver unlock is
 [**gpu-unlock**](https://github.com/Zagitta/gpu-unlock) by **Zagitta** — all
@@ -38,7 +40,8 @@ under: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 - Linux with NVIDIA **open** kernel modules
 - Kernel headers, `gcc`, `git`, `patch`, `make`
-- Two NVIDIA GPUs of the same generation
+- Two or more NVIDIA GPUs; `install.sh` targets modded cards (2080 Ti 22 GB,
+  3080 20 GB, 4080 32 GB, 4090 48 GB) and uneven rigs (see below)
 - systemd, OpenRC or dinit
 - Root (to load kernel modules)
 - ~2 GB disk
@@ -50,13 +53,25 @@ The installer pins the NVIDIA source tag it was written against; see
 ## Install
 
 ```bash
-git clone https://git.fedesito.me/fedes1to/modded-p2p
-cd modded-p2p
-sudo bash scripts/install.sh     # build + install + activate (screen blinks once)
+git clone https://git.fedesito.me/fedes1to/nvidia-gpu-patches
+cd nvidia-gpu-patches
+sudo bash scripts/install.sh     # detect the cards, install what applies
 sudo bash scripts/verify.sh      # must print: PASS
 ```
 
-The install persists across reboots. After a kernel upgrade, re-run
+`install.sh` picks the components from the cards it finds:
+
+- **gpu-unlock** — the GA102/GA104 compute unlock, installed on supported
+  cards. `--no-gpu-unlock` opts out; `--with-gpu-unlock` forces it.
+- **modded-p2p** — the barlink P2P driver, installed for modded cards
+  (2080 Ti 22 GB, 3080 20 GB, 4080 32 GB, 4090 48 GB) and for uneven rigs
+  (mixed models or memory) after a confirmation prompt. A uniform stock rig is
+  left on the stock driver; force it with `--with-modded-p2p`.
+- **vLLM custom all-reduce** — with an even GPU count (2/4/6/8) the installer
+  offers to apply the vLLM P2P patch to the vLLM venv.
+
+Non-interactive runs take the default (no) for the prompts; `--yes` accepts
+them. The install persists across reboots. After a kernel upgrade, re-run
 `install.sh`.
 
 Undo everything:
@@ -67,10 +82,7 @@ sudo bash scripts/revert.sh
 
 A reboot also returns to the stock driver.
 
-If a compatible GA102/GA104 card is detected, the installer also sets up the
-optional [compute unlock](docs/GPU-UNLOCK.md) automatically. `--no-gpu-unlock`
-opts out; `--with-gpu-unlock` forces it on a machine where auto-detection is not
-wanted.
+The compute unlock itself is documented in [docs/GPU-UNLOCK.md](docs/GPU-UNLOCK.md).
 
 ## vLLM and sglang
 
@@ -86,7 +98,15 @@ vLLM requires a specific PyTorch build, so give it its own environment:
 ```bash
 python3 -m venv ~/venv-vllm
 ~/venv-vllm/bin/pip install vllm
-~/venv-vllm/bin/pip install -e /path/to/barlink-pcie -e /path/to/modded-p2p/integrations/python
+~/venv-vllm/bin/pip install -e /path/to/barlink-pcie -e /path/to/nvidia-gpu-patches/integrations/python
+```
+
+The venv must carry the barlink patches, and on an even GPU count the vLLM
+custom all-reduce patch. One command applies both:
+
+```bash
+sudo bash scripts/patch-venvs.sh              # auto-detects ~/venv-vllm, ~/venv-sglang
+sudo bash scripts/patch-venvs.sh ~/venv-vllm ~/venv-sglang
 ```
 
 Start it (root is required — the driver's P2P path asks for a permission only
@@ -122,7 +142,9 @@ its wheels exist for (see its installation docs).
 ```bash
 python3 -m venv ~/venv-sglang
 ~/venv-sglang/bin/pip install sglang
-~/venv-sglang/bin/pip install -e /path/to/barlink-pcie -e /path/to/modded-p2p/integrations/python
+~/venv-sglang/bin/pip install -e /path/to/barlink-pcie -e /path/to/nvidia-gpu-patches/integrations/python
+
+sudo bash scripts/patch-venvs.sh ~/venv-sglang   # barlink patches for this venv
 
 . /etc/profile.d/barlink-p2p.sh
 export MODDED_P2P_SGLANG=1

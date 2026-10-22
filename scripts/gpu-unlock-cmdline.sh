@@ -300,7 +300,7 @@ edit_uki_file() { # $1 = relative file, $2 = add|remove
       return 0
     fi
     {
-      printf '%s\n' '# modded-p2p: gpu_unlock cmdline option (created by install-gpu-unlock.sh)'
+      printf '%s\n' '# nvidia-gpu-patches: gpu_unlock cmdline option (created by install-gpu-unlock.sh)'
       printf '%s %s\n' "$body" "$(token)" | sed -E 's/^ +//'
     } > "$out"
     apply_new "$1" "$out"
@@ -309,9 +309,9 @@ edit_uki_file() { # $1 = relative file, $2 = add|remove
   comments="$(grep -E '^[[:space:]]*#' "$f" || true)"
   body="$(grep -vE '^[[:space:]]*(#|$)' "$f" | tr '\n' ' ' | strip_tokens || true)"
   {
-    printf '%s\n' "$comments" | grep -v 'modded-p2p: gpu_unlock' || true
+    printf '%s\n' "$comments" | grep -vE '^(# )?(modded-p2p|nvidia-gpu-patches): gpu_unlock' || true
     if [ "$2" = add ]; then
-      printf '%s\n' '# modded-p2p: gpu_unlock cmdline option'
+      printf '%s\n' '# nvidia-gpu-patches: gpu_unlock cmdline option'
       printf '%s %s\n' "$body" "$(token)" | sed -E 's/^ +//'
     elif [ -n "$body" ]; then
       printf '%s\n' "$body"

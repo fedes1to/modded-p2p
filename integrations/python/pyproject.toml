@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "modded-p2p"
+name = "nvidia-gpu-patches"
 version = "0.1.0"
 description = "Framework seams that route torch.distributed collectives through barlink-pcie's BAR1 transport (vLLM, sglang)"
 requires-python = ">=3.10"
