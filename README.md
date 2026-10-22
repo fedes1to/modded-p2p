@@ -67,9 +67,9 @@ sudo bash scripts/revert.sh
 
 A reboot also returns to the stock driver.
 
-On GA102/GA104 machines the installer also sets up the optional
-[compute unlock](docs/GPU-UNLOCK.md) described below. `--no-gpu-unlock` opts
-out; `--with-gpu-unlock` forces it on a machine where auto-detection is not
+If a compatible GA102/GA104 card is detected, the installer also sets up the
+optional [compute unlock](docs/GPU-UNLOCK.md) automatically. `--no-gpu-unlock`
+opts out; `--with-gpu-unlock` forces it on a machine where auto-detection is not
 wanted.
 
 ## vLLM and sglang
@@ -171,7 +171,8 @@ sudo bash scripts/install-gpu-unlock.sh          # auto-detects the cards
 sudo bash scripts/install.sh --with-gpu-unlock   # or as part of the main install
 ```
 
-It is enabled automatically by `install.sh` when a GA102/GA104 card is present.
+It is enabled automatically by `install.sh` when a compatible GA102/GA104 card
+is present.
 It runs from the next boot; upstream's supported path is a cold boot, though
 kernels ≥ 6.16 also applied it after a warm reboot here. Verify with
 `dmesg | grep gpu_unlock` (root) or `journalctl -k -b` with journald.
